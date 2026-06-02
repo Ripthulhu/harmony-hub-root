@@ -1,6 +1,6 @@
 # Harmony Hub LAN Root SSH Tool
 
-For an owned Logitech Harmony Hub on the same LAN as a Windows PC.
+Gains root access and then installs and runs a dropbear binary for ssh access.
 
 ## Files
 
