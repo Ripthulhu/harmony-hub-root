@@ -1,20 +1,22 @@
 # Harmony Hub LAN Root SSH Tool
 
-Gains root access and then installs and runs a dropbear binary for ssh access.
+For an owned Logitech Harmony Hub on the same LAN as your computer. The tool
+gains root access, installs Dropbear, and starts persistent SSH access.
 
 ## Files
 
 - `Start_XMPP_Root_Shell.cmd` - double-click launcher
 - `run_xmpp_root_shell.ps1` - PowerShell wrapper
+- `run_xmpp_root_shell.sh` - Linux/macOS shell wrapper
 - `harmony_xmpp_root_shell.py` - LAN installer
 - `dropbearmulti` - MIPS Dropbear binary for Harmony Hub
 - `SHA256SUMS.txt` - integrity hashes
 
 ## Requirements
 
-- Windows 10/11
+- Windows 10/11, Linux, or macOS
 - Python 3.10 or newer
-- Windows OpenSSH client
+- OpenSSH client tools: `ssh` and `ssh-keygen`
 - Harmony Hub IP address
 - PC and hub on the same LAN
 - The hub has completed normal first-time setup in the Harmony phone app
@@ -25,6 +27,8 @@ Gains root access and then installs and runs a dropbear binary for ssh access.
 Finish setup in the Harmony phone app first. The hub must already be joined to
 Wi-Fi, linked to the app, and reachable on the local network with XMPP enabled.
 
+### Windows
+
 Double-click:
 
 ```text
@@ -33,16 +37,37 @@ Start_XMPP_Root_Shell.cmd
 
 Enter the hub IP address when prompted.
 
-The tool creates an SSH key at:
+The tool creates or reuses an SSH key at:
 
 ```text
 %USERPROFILE%\.ssh\harmony_owner_ed25519
+```
+
+### Linux/macOS
+
+From the repository root:
+
+```bash
+./run_xmpp_root_shell.sh --host <hub-ip>
+```
+
+Or call Python directly:
+
+```bash
+python3 harmony_xmpp_root_shell.py --host <hub-ip>
+```
+
+The tool creates or reuses an SSH key at:
+
+```text
+~/.ssh/harmony_owner_ed25519
 ```
 
 It installs persistent root SSH and then opens a root shell:
 
 ```text
 ssh -i %USERPROFILE%\.ssh\harmony_owner_ed25519 root@<hub-ip>
+ssh -i ~/.ssh/harmony_owner_ed25519 root@<hub-ip>
 ```
 
 ## Tested Firmware
@@ -156,5 +181,6 @@ SSH persists after reboot through the stock `/etc/tdeenable` boot path.
 ## Notes
 
 If SSH warns that the host key changed, remove the old hub entry from
-`%USERPROFILE%\.ssh\known_hosts` and reconnect. This is expected if the hub was
-previously rooted or reset.
+`%USERPROFILE%\.ssh\known_hosts` on Windows or `~/.ssh/known_hosts` on
+Linux/macOS and reconnect. This is expected if the hub was previously rooted or
+reset.

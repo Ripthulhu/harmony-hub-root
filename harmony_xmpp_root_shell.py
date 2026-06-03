@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -432,22 +433,53 @@ def resolve_input_path(value: str) -> pathlib.Path:
 
 
 def default_key_path() -> pathlib.Path:
-    home = pathlib.Path(os.environ.get("USERPROFILE") or pathlib.Path.home())
-    return home / ".ssh" / "harmony_owner_ed25519"
+    return pathlib.Path.home() / ".ssh" / "harmony_owner_ed25519"
+
+
+def require_tool(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        raise SystemExit(f"{name} was not found in PATH. Install OpenSSH client tools and try again.")
+    return path
+
+
+def lock_down_private_key(private_key: pathlib.Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        private_key.chmod(0o600)
+    except OSError as exc:
+        raise SystemExit(f"failed to set 0600 permissions on {private_key}: {exc}") from exc
 
 
 def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
-    if public_key.exists():
+    ssh_keygen = require_tool("ssh-keygen")
+    try:
+        private_exists = private_key.exists()
+        public_exists = public_key.exists()
+    except OSError as exc:
+        raise SystemExit(f"cannot access SSH key path {private_key}: {exc}") from exc
+    if private_exists and public_exists:
         info(f"Using existing SSH public key: {public_key}")
+        lock_down_private_key(private_key)
         return
+    if private_exists and not public_exists:
+        info(f"Private key exists but public key is missing; deriving {public_key}")
+        public_key.write_text(
+            subprocess.check_output([ssh_keygen, "-y", "-f", str(private_key)], text=True).strip() + "\n",
+            encoding="utf-8",
+        )
+        lock_down_private_key(private_key)
+        return
+    if public_exists and not private_exists:
+        raise SystemExit(f"public key exists but private key is missing: {private_key}")
     private_key.parent.mkdir(parents=True, exist_ok=True)
-    if private_key.exists():
-        raise SystemExit(f"private key exists but public key is missing: {private_key}")
     info(f"No SSH key found; generating ed25519 keypair at {private_key}")
     subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-f", str(private_key), "-N", "", "-C", "harmony-owner"],
+        [ssh_keygen, "-q", "-t", "ed25519", "-f", str(private_key), "-N", "", "-C", "harmony-owner"],
         check=True,
     )
+    lock_down_private_key(private_key)
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -953,8 +985,9 @@ def wait_for_port(host: str, port: int, timeout_s: int) -> bool:
 
 
 def open_root_shell(host: str, private_key: pathlib.Path) -> int:
+    ssh = require_tool("ssh")
     ssh = [
-        "ssh",
+        ssh,
         "-i", str(private_key),
         "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=accept-new",
@@ -985,7 +1018,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     step("Harmony Hub LAN Root SSH Installer")
-    info("This tool is for an owned Harmony Hub on the same LAN as this Windows PC.")
+    info("This tool is for an owned Harmony Hub on the same LAN as this computer.")
     info("It installs persistent root SSH, then optionally opens an interactive root shell.")
     host = args.host.strip() if args.host else ""
     if not host and not args.dry_run:
@@ -1055,7 +1088,7 @@ def main() -> None:
         raise SystemExit("Dropbear did not open port 22 inside the wait window")
     if not args.no_shell:
         step("Opening Root Shell")
-        info("If Windows/OpenSSH reports a changed host key, the install still succeeded; reconnect after removing the old known_hosts entry.")
+        info("If OpenSSH reports a changed host key, the install still succeeded; reconnect after removing the old known_hosts entry.")
         ssh_code = open_root_shell(host, private_key)
         if ssh_code != 0:
             print("")
