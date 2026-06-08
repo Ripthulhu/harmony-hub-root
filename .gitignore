@@ -5,5 +5,7 @@ __pycache__/
 .venv/
 venv/
 *.log
+harmony_hub_id.txt
+harmony_hub_id.json
 .DS_Store
 Thumbs.db

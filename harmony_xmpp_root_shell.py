@@ -785,6 +785,56 @@ def collect_hub_ids(host: str, hbus_port: int, xmpp: XmppTransport, sysinfo_payl
     return hub_ids
 
 
+def save_hub_id_handoff(host: str, hub_id: str, candidates: list[str]) -> list[pathlib.Path]:
+    if not hub_id:
+        return []
+
+    saved_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    metadata = {
+        "host": host,
+        "hub_id": hub_id,
+        "candidates": candidates,
+        "saved_at": saved_at,
+        "source": "harmony-hub-root",
+    }
+    written: list[pathlib.Path] = []
+
+    def write_text(path: pathlib.Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        written.append(path)
+
+    config_dir = pathlib.Path.home() / ".harmony-hub"
+    try:
+        write_text(config_dir / "hub_id.txt", hub_id + "\n")
+        write_text(config_dir / "last_root.json", json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+        known_path = config_dir / "known_hubs.json"
+        try:
+            known = json.loads(known_path.read_text(encoding="utf-8")) if known_path.exists() else {}
+            if not isinstance(known, dict):
+                known = {}
+        except Exception:
+            known = {}
+        known[host] = metadata
+        write_text(known_path, json.dumps(known, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"WARNING: could not write per-user Hub ID handoff files: {exc}")
+
+    for name, text in [
+        ("harmony_hub_id.txt", hub_id + "\n"),
+        ("harmony_hub_id.json", json.dumps(metadata, indent=2, sort_keys=True) + "\n"),
+    ]:
+        try:
+            path = SCRIPT_DIR / name
+            path.write_text(text, encoding="utf-8")
+            written.append(path)
+        except OSError as exc:
+            print(f"WARNING: could not write {SCRIPT_DIR / name}: {exc}")
+
+    return written
+
+
 def refresh_xmpp_session(xmpp: XmppTransport, host: str, xmpp_port: int, label: str) -> None:
     print(label)
     xmpp.close()
@@ -868,7 +918,7 @@ def upload_and_install(
     manifest: dict[str, Any],
     chunks: dict[str, str],
     sysinfo_payload: str,
-) -> None:
+) -> tuple[str, list[str]]:
     package_abs = f"/pkg/{package_name}"
     stage_chunks_abs = stage_path + "/chunks"
 
@@ -876,6 +926,7 @@ def upload_and_install(
     step("Finding WebSocket Hub ID")
     info("The installer uses XMPP for the initial gate and WebSocket for structured package writes.")
     hub_ids = collect_hub_ids(host, hbus_port, xmpp, sysinfo_payload)
+    selected_hub_id = hub_ids[0] if hub_ids else ""
     if hub_ids:
         print("auto_detected_hub_ids=" + ",".join(hub_ids))
     else:
@@ -949,6 +1000,7 @@ def upload_and_install(
             print(f"websocket discover: code={ws_code or '?'} preview={response_preview(ws_resp, 700)}")
             if ws_code == "200":
                 triggered = True
+                selected_hub_id = hub_id
                 break
             if ws_code not in ("202", "203"):
                 break
@@ -971,6 +1023,7 @@ def upload_and_install(
             if not parsed.get("ok"):
                 raise SystemExit("installer reported failure: " + str(parsed.get("error")))
             info("Hub-side installer reported success.")
+    return selected_hub_id, hub_ids
 
 
 def wait_for_port(host: str, port: int, timeout_s: int) -> bool:
@@ -1066,7 +1119,7 @@ def main() -> None:
         sysinfo = xmpp.call("connect.sysinfo?get", "", 15)
         print_xmpp("connect.sysinfo?get", sysinfo)
         info("Hub responded; continuing with the installer.")
-        upload_and_install(
+        hub_id, hub_id_candidates = upload_and_install(
             xmpp,
             host,
             args.xmpp_port,
@@ -1078,6 +1131,19 @@ def main() -> None:
             chunks,
             sysinfo.payload,
         )
+
+    if hub_id:
+        step("Hub ID Handoff")
+        print(f"hub_id={hub_id}")
+        if hub_id_candidates:
+            print("hub_id_candidates=" + ",".join(hub_id_candidates))
+        for path in save_hub_id_handoff(host, hub_id, hub_id_candidates):
+            print(f"wrote_hub_id_file={path}")
+        info("The Harmony Hub Control web UI installer reads the per-user handoff file automatically.")
+    else:
+        print("")
+        print("WARNING: Root SSH was installed, but no Hub ID was detected.")
+        print("The web UI installer requires the real Hub ID. Re-run this tool with the hub online and save the full output.")
 
     step("Waiting For SSH")
     info("The installer has finished; waiting for Dropbear to listen on port 22.")

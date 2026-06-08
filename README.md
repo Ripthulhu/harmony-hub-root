@@ -70,6 +70,27 @@ ssh -i %USERPROFILE%\.ssh\harmony_owner_ed25519 root@<hub-ip>
 ssh -i ~/.ssh/harmony_owner_ed25519 root@<hub-ip>
 ```
 
+At the end, the tool prints the detected Harmony Hub ID as:
+
+```text
+hub_id=<numeric-id>
+```
+
+It also writes the same value to handoff files for the post-root web UI
+installer:
+
+```text
+%USERPROFILE%\.harmony-hub\hub_id.txt
+%USERPROFILE%\.harmony-hub\last_root.json
+%USERPROFILE%\.harmony-hub\known_hubs.json
+~/.harmony-hub/hub_id.txt
+~/.harmony-hub/last_root.json
+~/.harmony-hub/known_hubs.json
+```
+
+The Hub ID is required by Harmony's local WebSocket/HBus API. Do not substitute
+a guessed value.
+
 ## Tested Firmware
 
 This tool was tested on Logitech Harmony Hub firmware `4.15.600`.
