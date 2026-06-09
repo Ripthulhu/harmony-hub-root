@@ -21,7 +21,6 @@ ACTION_CHOICES = (
     "usb-wifi-status",
     "usb-wifi-scan",
     "usb-provision-wifi",
-    "usb-root-ssh",
     "usb-factory-reset",
     "usb-flash-firmware",
 )
@@ -37,9 +36,8 @@ def read_action() -> str:
     print("5. Wi-Fi status over USB")
     print("6. Wi-Fi scan over USB")
     print("7. Provision Wi-Fi over USB")
-    print("8. USB root SSH install")
-    print("9. Factory reset over USB")
-    print("10. Flash firmware over USB (.hfw2)")
+    print("8. Factory reset over USB")
+    print("9. Flash firmware over USB (.hfw2)")
     print("")
     mapping = {
         "1": "lan-root",
@@ -49,15 +47,14 @@ def read_action() -> str:
         "5": "usb-wifi-status",
         "6": "usb-wifi-scan",
         "7": "usb-provision-wifi",
-        "8": "usb-root-ssh",
-        "9": "usb-factory-reset",
-        "10": "usb-flash-firmware",
+        "8": "usb-factory-reset",
+        "9": "usb-flash-firmware",
     }
     while True:
-        choice = input("Choose an action [1-10]: ").strip()
+        choice = input("Choose an action [1-9]: ").strip()
         if choice in mapping:
             return mapping[choice]
-        print("Enter a number from 1 to 10.")
+        print("Enter a number from 1 to 9.")
 
 
 def resolve_host_alias(args: argparse.Namespace) -> None:
@@ -114,17 +111,11 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
         str(SCRIPT_DIR / "harmony_usb_bridge.py"),
         "--action",
         usb_action,
-        "--package-root",
-        ".",
         "--backend",
         args.usb_backend,
     ]
     if args.hub_ip:
         argv += ["--hub-ip", args.hub_ip]
-    if args.public_key_file:
-        argv += ["--public-key-file", args.public_key_file]
-    if args.private_key_file:
-        argv += ["--private-key-file", args.private_key_file]
     if args.ssid:
         argv += ["--ssid", args.ssid]
     if args.wifi_password != "":
@@ -149,30 +140,26 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
 
 
 def ensure_usb_prompt_args(args: argparse.Namespace, action: str) -> None:
-    if action == "usb-wifi-scan" and not args.show_ssids:
+    if action == "usb-wifi-scan" and not args.show_ssids and not args.dry_run and not args.yes:
         answer = input("Show SSIDs in scan output? [y/N]: ").strip().lower()
         if answer in {"y", "yes"}:
             args.show_ssids = True
     elif action == "usb-provision-wifi":
         resolve_host_alias(args)
-        if not args.ssid:
+        if not args.ssid and not args.dry_run:
             args.ssid = input("Wi-Fi SSID: ").strip()
         if not args.encryption:
             args.encryption = "WPA2-PSK"
-        if args.encryption.upper() not in {"NONE", "OPEN"} and args.wifi_password == "":
+        if args.encryption.upper() not in {"NONE", "OPEN"} and args.wifi_password == "" and not args.dry_run:
             args.wifi_password = getpass.getpass("Wi-Fi password: ")
         if args.dry_run:
             return
-        if not args.wait_for_lan:
+        if not args.wait_for_lan and not args.yes:
             answer = input("Wait for LAN reachability after provisioning? [y/N]: ").strip().lower()
             if answer in {"y", "yes"}:
                 args.wait_for_lan = True
         if args.wait_for_lan and not args.hub_ip:
             args.hub_ip = input("Expected hub IP for LAN check: ").strip()
-    elif action == "usb-root-ssh":
-        resolve_host_alias(args)
-        if not args.hub_ip:
-            args.hub_ip = input("Harmony Hub IP for optional SSH verification (leave blank to skip): ").strip()
     elif action == "usb-flash-firmware":
         if not args.firmware_file:
             args.firmware_file = input("Path to .hfw2 firmware file: ").strip().strip('"')
@@ -194,8 +181,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-shell", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--usb-backend", choices=("auto", "hidapi", "hidraw", "winhid"), default="auto")
-    parser.add_argument("--public-key-file", default="")
-    parser.add_argument("--private-key-file", default="")
     parser.add_argument("--ssid", default="")
     parser.add_argument("--wifi-password", default="")
     parser.add_argument("--encryption", default="WPA2-PSK")
@@ -238,10 +223,6 @@ def main() -> None:
         ensure_usb_prompt_args(args, action)
         print("Running Harmony Hub USB bridge action: provision-wifi", flush=True)
         run_subprocess(usb_args(args, "provision-wifi"))
-    elif action == "usb-root-ssh":
-        ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: root-ssh", flush=True)
-        run_subprocess(usb_args(args, "root-ssh"))
     elif action == "usb-factory-reset":
         ensure_usb_prompt_args(args, action)
         print("Running Harmony Hub USB bridge action: factory-reset", flush=True)

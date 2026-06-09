@@ -9,7 +9,7 @@ hidraw fallback that uses only Python's standard library.
 from __future__ import annotations
 
 import argparse
-import base64
+import contextlib
 import csv
 import ctypes
 import dataclasses
@@ -22,11 +22,10 @@ import os
 import pathlib
 import random
 import select
-import shutil
 import socket
-import stat
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -38,6 +37,11 @@ DEFAULT_VENDOR_ID = 0x046D
 DEFAULT_PRODUCT_ID = 0xC129
 DEFAULT_INPUT_REPORT_LENGTH = 65
 DEFAULT_OUTPUT_REPORT_LENGTH = 65
+USB_LOCK_PATH = SCRIPT_DIR / ".harmony_usb_bridge.lock"
+RAW_DEVICE_INFO_PATH = "/rf/deviceinfo"
+RAW_WIFI_STATUS_PATH = "/sys/wifi/connect"
+RAW_WIFI_NETWORKS_PATH = "/sys/wifi/networks"
+RAW_WIFI_CONNECT_PATH = "/sys/wifi/connect"
 WINDOWS_USB_OWNER_PROCESS_NAMES = {
     "iexplore.exe",
     "logipluginservice.exe",
@@ -50,8 +54,6 @@ ACTION_CHOICES = (
     "drain",
     "preflight",
     "resync",
-    "stage-summary",
-    "root-ssh",
     "sysinfo",
     "wifi-status",
     "wifi-scan",
@@ -136,14 +138,14 @@ class RawResponse:
 
 
 @dataclasses.dataclass
-class StageFile:
-    id: str
-    source: str
-    path: str
-    mode: str
-    bytes: int
-    md5: str
-    data: str
+class RawFileRead:
+    device_path: str
+    remote_path: str
+    size: int
+    data: bytes
+    open_response: RawResponse
+    read_responses: list[RawResponse]
+    close_response: RawResponse | None
 
 
 @dataclasses.dataclass
@@ -194,7 +196,43 @@ def compact_json(obj: Any) -> str:
 
 
 def pretty_json(obj: Any) -> str:
-    return json.dumps(to_jsonable(obj), indent=2, ensure_ascii=False)
+    return json.dumps(to_jsonable(obj), indent=2, ensure_ascii=True)
+
+
+@contextlib.contextmanager
+def usb_process_lock() -> Any:
+    USB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with USB_LOCK_PATH.open("a+b") as lock_file:
+        lock_file.seek(0)
+        lock_file.write(b"\0")
+        lock_file.flush()
+        if sys.platform.startswith("win"):
+            import msvcrt
+
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise UsbBridgeError("another Harmony USB bridge process is already running; wait for it to finish before starting another USB action.") from exc
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            try:
+                import fcntl
+            except ImportError:
+                yield
+                return
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise UsbBridgeError("another Harmony USB bridge process is already running; wait for it to finish before starting another USB action.") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -223,10 +261,6 @@ def md5_bytes(data: bytes) -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def now_epoch() -> int:
-    return int(time.time())
 
 
 def parse_descriptor_int(value: str, default: int = 0) -> int:
@@ -535,6 +569,10 @@ class WindowsHidApi:
         self.hid.HidD_GetHidGuid.restype = None
         self.hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(WinHidAttributes)]
         self.hid.HidD_GetAttributes.restype = ctypes.c_bool
+        self.hid.HidD_SetNumInputBuffers.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.hid.HidD_SetNumInputBuffers.restype = ctypes.c_bool
+        self.hid.HidD_FlushQueue.argtypes = [ctypes.c_void_p]
+        self.hid.HidD_FlushQueue.restype = ctypes.c_bool
         self.hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
         self.hid.HidD_GetPreparsedData.restype = ctypes.c_bool
         self.hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
@@ -732,10 +770,11 @@ class WindowsHidApi:
 class WindowsHidHandle(HidHandle):
     def __init__(self, api: WindowsHidApi, path: str) -> None:
         self._api = api
-        self._read_handle = api.open_path(path, api.GENERIC_READ, overlapped=True)
-        self._write_handle = api.open_path(path, api.GENERIC_WRITE, overlapped=False)
+        self._handle = api.open_path(path, api.GENERIC_READ | api.GENERIC_WRITE, overlapped=True)
+        api.hid.HidD_SetNumInputBuffers(self._handle, 64)
+        api.hid.HidD_FlushQueue(self._handle)
 
-    def _overlapped_io(self, fn: Any, buffer: Any, length: int, timeout_ms: int) -> int:
+    def _overlapped_io(self, fn: Any, buffer: Any, length: int, timeout_ms: int, label: str) -> int:
         event = self._api.kernel32.CreateEventW(None, True, False, None)
         if self._api.invalid_handle(event):
             raise OSError(ctypes.get_last_error(), "CreateEventW failed")
@@ -743,17 +782,17 @@ class WindowsHidHandle(HidHandle):
         overlapped.hEvent = event
         transferred = ctypes.c_ulong(0)
         try:
-            ok = fn(self._read_handle, buffer, length, None, ctypes.byref(overlapped))
+            ok = fn(self._handle, buffer, length, None, ctypes.byref(overlapped))
             err = ctypes.get_last_error()
             if not ok and err != self._api.ERROR_IO_PENDING:
-                raise OSError(err, "HID overlapped I/O failed")
+                raise OSError(err, f"HID overlapped {label} failed")
             if not ok:
                 wait = self._api.kernel32.WaitForSingleObject(event, max(1, timeout_ms))
                 if wait == self._api.WAIT_TIMEOUT:
-                    self._api.kernel32.CancelIoEx(self._read_handle, ctypes.byref(overlapped))
+                    self._api.kernel32.CancelIoEx(self._handle, ctypes.byref(overlapped))
                     self._api.kernel32.WaitForSingleObject(event, 1000)
                     cancel_ok = self._api.kernel32.GetOverlappedResult(
-                        self._read_handle,
+                        self._handle,
                         ctypes.byref(overlapped),
                         ctypes.byref(transferred),
                         False,
@@ -761,11 +800,11 @@ class WindowsHidHandle(HidHandle):
                     if not cancel_ok:
                         err = ctypes.get_last_error()
                         if err != self._api.ERROR_OPERATION_ABORTED:
-                            raise OSError(err, "cancelled HID overlapped I/O failed")
+                            raise OSError(err, f"cancelled HID overlapped {label} failed")
                     return 0
                 if wait != self._api.WAIT_OBJECT_0:
                     raise OSError(ctypes.get_last_error(), f"WaitForSingleObject failed: {wait}")
-            ok = self._api.kernel32.GetOverlappedResult(self._read_handle, ctypes.byref(overlapped), ctypes.byref(transferred), False)
+            ok = self._api.kernel32.GetOverlappedResult(self._handle, ctypes.byref(overlapped), ctypes.byref(transferred), False)
             if not ok:
                 raise OSError(ctypes.get_last_error(), "GetOverlappedResult failed")
             return int(transferred.value)
@@ -774,26 +813,20 @@ class WindowsHidHandle(HidHandle):
 
     def write(self, report: bytes) -> None:
         buffer = ctypes.create_string_buffer(report, len(report))
-        written_value = ctypes.c_ulong(0)
-        ok = self._api.kernel32.WriteFile(self._write_handle, buffer, len(report), ctypes.byref(written_value), None)
-        if not ok:
-            raise OSError(ctypes.get_last_error(), "HID synchronous write failed")
-        written = int(written_value.value)
+        written = self._overlapped_io(self._api.kernel32.WriteFile, buffer, len(report), 5000, "write")
         if written != len(report):
             raise OSError(f"short HID write: {written}/{len(report)}")
 
     def read(self, length: int, timeout_ms: int) -> bytes:
         buffer = ctypes.create_string_buffer(length)
-        read = self._overlapped_io(self._api.kernel32.ReadFile, buffer, length, timeout_ms)
+        read = self._overlapped_io(self._api.kernel32.ReadFile, buffer, length, timeout_ms, "read")
         if read <= 0:
             return b""
         return bytes(buffer.raw[:read])
 
     def close(self) -> None:
-        self._api.close_handle(self._read_handle)
-        self._api.close_handle(self._write_handle)
-        self._read_handle = None
-        self._write_handle = None
+        self._api.close_handle(self._handle)
+        self._handle = None
 
 
 class WindowsNativeBackend(HidBackend):
@@ -1064,7 +1097,7 @@ def candidate_matches(candidate: Candidate | None, expected_id: int, allow_loose
 def new_ltcp_frames(request_json: str) -> list[bytes]:
     payload = request_json.encode("ascii")
     if len(payload) > 16383:
-        raise UsbBridgeError(f"Payload is too large for one LTCP secondary packet ({len(payload)} bytes). Lower --chunk-size.")
+        raise UsbBridgeError(f"Payload is too large for one LTCP secondary packet ({len(payload)} bytes).")
     stream = bytearray([0xFF, 0x08, 0x00, 0x01, 0x01, 0x02, 0x01])
     if len(payload) > 63:
         stream.append(0x80 | 0x40 | ((len(payload) >> 8) & 0x3F))
@@ -1090,13 +1123,13 @@ def raw_param_byte(value: int) -> bytes:
 def raw_param_word(value: int) -> bytes:
     if value < 0 or value > 0xFFFF:
         raise UsbBridgeError(f"word parameter out of range: {value}")
-    return bytes([0x02, (value >> 8) & 0xFF, value & 0xFF])
+    return bytes([0x02, value & 0xFF, (value >> 8) & 0xFF])
 
 
 def raw_param_dword(value: int) -> bytes:
     if value < 0 or value > 0xFFFFFFFF:
         raise UsbBridgeError(f"dword parameter out of range: {value}")
-    return bytes([0x04, (value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+    return bytes([0x04, value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, (value >> 24) & 0xFF])
 
 
 def raw_param_string(value: str) -> bytes:
@@ -1106,7 +1139,7 @@ def raw_param_string(value: str) -> bytes:
         raise UsbBridgeError(f"raw LTCP string parameters must be ASCII: {value!r}") from exc
     if b"\x00" in data:
         raise UsbBridgeError("raw LTCP string parameters cannot contain NUL bytes")
-    return b"\x00" + data + b"\x00"
+    return b"\x80" + data + b"\x00"
 
 
 def raw_frames_from_stream(stream: bytes) -> list[bytes]:
@@ -1158,10 +1191,17 @@ def raw_done_frame() -> bytes:
     return bytes(frame)
 
 
-def find_raw_response_packet(raw: bytes, command_id: int, sequence: int) -> bytes:
+def find_raw_response_offset(raw: bytes, command_id: int, sequence: int) -> int:
     for offset in range(0, max(0, len(raw) - 3)):
-        if raw[offset] == 0xFF and raw[offset + 1] == command_id and raw[offset + 2] == sequence:
-            return raw[offset : offset + 64]
+        if raw[offset] == 0xFF and raw[offset + 1] == command_id and (raw[offset + 2] & 0x7F) == (sequence & 0x7F):
+            return offset
+    return -1
+
+
+def find_raw_response_packet(raw: bytes, command_id: int, sequence: int) -> bytes:
+    offset = find_raw_response_offset(raw, command_id, sequence)
+    if offset >= 0:
+        return raw[offset : offset + 64]
     return b""
 
 
@@ -1256,6 +1296,77 @@ class HarmonyUsbBridge:
             self.next_raw_sequence = 1
         return sequence
 
+    def exchange_reports(
+        self,
+        handle: HidHandle,
+        device: DeviceInfo,
+        frames: list[bytes],
+        read_timeout_ms: int,
+        expect_response: bool,
+        stop_when: Any,
+    ) -> tuple[bytes, list[dict[str, Any]]]:
+        if device.output_report_length != DEFAULT_OUTPUT_REPORT_LENGTH:
+            raise UsbBridgeError(f"Unexpected output report length {device.output_report_length}; expected 65.")
+        for frame in frames:
+            if len(frame) != 64:
+                raise UsbBridgeError(f"raw HID frame should be 64 bytes, got {len(frame)}")
+
+        raw_response = bytearray()
+        read_reports: list[dict[str, Any]] = []
+        if not expect_response:
+            for frame in frames:
+                handle.write(b"\x00" + frame)
+            return bytes(raw_response), read_reports
+
+        deadline = time.monotonic() + read_timeout_ms / 1000.0
+        if device.backend == "winhid":
+            lock = threading.Lock()
+            stop = threading.Event()
+            started = threading.Event()
+
+            def read_loop() -> None:
+                started.set()
+                while not stop.is_set() and time.monotonic() < deadline:
+                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    report = handle.read(device.input_report_length, min(remaining_ms, 250))
+                    if not report:
+                        continue
+                    with lock:
+                        read_reports.append({"bytesRead": len(report), "hex": hex_string(report)})
+                        raw_response.extend(normalize_input_report(report))
+
+            reader = threading.Thread(target=read_loop, name="harmony-usb-read", daemon=True)
+            reader.start()
+            started.wait(0.25)
+            time.sleep(0.02)
+            try:
+                for frame in frames:
+                    handle.write(b"\x00" + frame)
+                while time.monotonic() < deadline:
+                    with lock:
+                        raw_snapshot = bytes(raw_response)
+                    if raw_snapshot and stop_when(raw_snapshot):
+                        break
+                    time.sleep(0.01)
+            finally:
+                stop.set()
+                reader.join(timeout=1.0)
+            with lock:
+                return bytes(raw_response), list(read_reports)
+
+        for frame in frames:
+            handle.write(b"\x00" + frame)
+        while time.monotonic() < deadline:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            report = handle.read(device.input_report_length, remaining_ms)
+            if not report:
+                break
+            read_reports.append({"bytesRead": len(report), "hex": hex_string(report)})
+            raw_response.extend(normalize_input_report(report))
+            if stop_when(bytes(raw_response)):
+                break
+        return bytes(raw_response), read_reports
+
     def raw_exchange(
         self,
         command_id: int,
@@ -1271,35 +1382,37 @@ class HarmonyUsbBridge:
             except Exception as exc:
                 drain_result = {"error": str(exc)}
 
-        raw_response = bytearray()
-        read_reports: list[dict[str, Any]] = []
-        packet = b""
         handle, device = self.open_handle()
         try:
-            if device.output_report_length != DEFAULT_OUTPUT_REPORT_LENGTH:
-                raise UsbBridgeError(f"Unexpected output report length {device.output_report_length}; expected 65.")
-            for frame in frames:
-                if len(frame) != 64:
-                    raise UsbBridgeError(f"raw HID frame should be 64 bytes, got {len(frame)}")
-                handle.write(b"\x00" + frame)
-
-            if expect_response:
-                deadline = time.monotonic() + read_timeout_ms / 1000.0
-                while time.monotonic() < deadline:
-                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-                    report = handle.read(device.input_report_length, remaining_ms)
-                    if not report:
-                        break
-                    read_reports.append({"bytesRead": len(report), "hex": hex_string(report)})
-                    raw_response.extend(normalize_input_report(report))
-                    packet = find_raw_response_packet(bytes(raw_response), command_id, sequence)
-                    if packet:
-                        break
+            return self.raw_exchange_on_handle(handle, device, command_id, frames, sequence, read_timeout_ms, expect_response, drain_result)
         finally:
             handle.close()
 
+    def raw_exchange_on_handle(
+        self,
+        handle: HidHandle,
+        device: DeviceInfo,
+        command_id: int,
+        frames: list[bytes],
+        sequence: int,
+        read_timeout_ms: int,
+        expect_response: bool = True,
+        drain_result: Any = None,
+        stop_when: Any | None = None,
+    ) -> RawResponse:
+        packet = b""
+        if stop_when is None:
+            stop_when = lambda raw: bool(find_raw_response_packet(raw, command_id, sequence))
+        raw_response, read_reports = self.exchange_reports(
+            handle,
+            device,
+            frames,
+            read_timeout_ms,
+            expect_response,
+            stop_when,
+        )
         if expect_response and not packet:
-            packet = find_raw_response_packet(bytes(raw_response), command_id, sequence)
+            packet = find_raw_response_packet(raw_response, command_id, sequence)
         return RawResponse(
             device_path=device.path,
             command_id=command_id,
@@ -1307,7 +1420,7 @@ class HarmonyUsbBridge:
             matched_response=bool(packet) if expect_response else True,
             frames_written=len(frames),
             raw_response_length=len(raw_response),
-            raw_response_hex=hex_string(bytes(raw_response)),
+            raw_response_hex=hex_string(raw_response),
             packet_hex=hex_string(packet),
             read_reports=read_reports,
             drain=drain_result,
@@ -1325,6 +1438,21 @@ class HarmonyUsbBridge:
         frames = raw_primary_frames(command_id, sequence, params, param_count)
         return self.raw_exchange(command_id, frames, sequence, read_timeout_ms, expect_response)
 
+    def raw_command_on_handle(
+        self,
+        handle: HidHandle,
+        device: DeviceInfo,
+        command_id: int,
+        params: list[bytes],
+        read_timeout_ms: int,
+        param_count: int | None = None,
+        expect_response: bool = True,
+        stop_when: Any | None = None,
+    ) -> RawResponse:
+        sequence = self.new_raw_sequence()
+        frames = raw_primary_frames(command_id, sequence, params, param_count)
+        return self.raw_exchange_on_handle(handle, device, command_id, frames, sequence, read_timeout_ms, expect_response, None, stop_when)
+
     def raw_write_data(
         self,
         handle_id: int,
@@ -1333,9 +1461,30 @@ class HarmonyUsbBridge:
         packets_per_chunk: int = 500,
         include_done: bool = False,
         label: str = "file",
+        packet_count_width: str = "word",
+    ) -> list[RawResponse]:
+        handle, device = self.open_handle()
+        try:
+            return self.raw_write_data_on_handle(handle, device, handle_id, data, read_timeout_ms, packets_per_chunk, include_done, label, packet_count_width)
+        finally:
+            handle.close()
+
+    def raw_write_data_on_handle(
+        self,
+        handle: HidHandle,
+        device: DeviceInfo,
+        handle_id: int,
+        data: bytes,
+        read_timeout_ms: int,
+        packets_per_chunk: int = 500,
+        include_done: bool = False,
+        label: str = "file",
+        packet_count_width: str = "word",
     ) -> list[RawResponse]:
         if packets_per_chunk <= 0 or packets_per_chunk > 0xFFFF:
             raise UsbBridgeError(f"packets_per_chunk out of range: {packets_per_chunk}")
+        if packet_count_width not in {"byte", "word"}:
+            raise UsbBridgeError(f"packet_count_width should be 'byte' or 'word', got {packet_count_width!r}")
         packet_data_size = 62
         chunk_size = packet_data_size * packets_per_chunk
         responses: list[RawResponse] = []
@@ -1345,12 +1494,13 @@ class HarmonyUsbBridge:
             data_packets = raw_data_frames(chunk, packet_data_size)
             packet_count = len(data_packets) + (1 if include_done else 0)
             sequence = self.new_raw_sequence()
-            frames = raw_primary_frames(0x03, sequence, [raw_param_byte(handle_id), raw_param_word(packet_count)])
+            count_param = raw_param_byte(packet_count) if packet_count_width == "byte" else raw_param_word(packet_count)
+            frames = raw_primary_frames(0x03, sequence, [raw_param_byte(handle_id), count_param])
             frames.extend(data_packets)
             if include_done:
                 frames.append(raw_done_frame())
             print(f"Writing {label}: chunk {index}/{total} bytes={len(chunk)} packets={packet_count}", flush=True)
-            response = self.raw_exchange(0x03, frames, sequence, read_timeout_ms, expect_response=True)
+            response = self.raw_exchange_on_handle(handle, device, 0x03, frames, sequence, read_timeout_ms, expect_response=True)
             assert_raw_ok(response, f"write {label} chunk {index}/{total}")
             responses.append(response)
         return responses
@@ -1370,37 +1520,30 @@ class HarmonyUsbBridge:
 
             request_id, request_json = self.new_command_json(command_name, command_data)
             frames = new_ltcp_frames(request_json)
-            raw_response = bytearray()
-            read_reports: list[dict[str, Any]] = []
             selected: Candidate | None = None
             candidates: list[Candidate] = []
             handle, device = self.open_handle()
             try:
-                if device.output_report_length != DEFAULT_OUTPUT_REPORT_LENGTH:
-                    raise UsbBridgeError(f"Unexpected output report length {device.output_report_length}; expected 65.")
-                for frame in frames:
-                    handle.write(b"\x00" + frame)
-
-                deadline = time.monotonic() + read_timeout_ms / 1000.0
-                while time.monotonic() < deadline:
-                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-                    report = handle.read(device.input_report_length, remaining_ms)
-                    if not report:
-                        break
-                    read_reports.append({"bytesRead": len(report), "hex": hex_string(report)})
-                    raw_response.extend(normalize_input_report(report))
-                    candidates = ltcp_candidates(bytes(raw_response))
-                    selected = select_ltcp_candidate(candidates, request_id, self.args.loose_response_match)
-                    if candidate_matches(selected, request_id, self.args.loose_response_match):
-                        break
+                raw_response, read_reports = self.exchange_reports(
+                    handle,
+                    device,
+                    frames,
+                    read_timeout_ms,
+                    True,
+                    lambda raw: candidate_matches(
+                        select_ltcp_candidate(ltcp_candidates(raw), request_id, self.args.loose_response_match),
+                        request_id,
+                        self.args.loose_response_match,
+                    ),
+                )
             finally:
                 handle.close()
 
             if not selected:
-                candidates = ltcp_candidates(bytes(raw_response))
+                candidates = ltcp_candidates(raw_response)
                 selected = select_ltcp_candidate(candidates, request_id, self.args.loose_response_match)
 
-            decode = selected.decode if selected else decode_ltcp(bytes(raw_response))
+            decode = selected.decode if selected else decode_ltcp(raw_response)
             payload_object = selected.payload_object if selected else convert_json_payload(decode.payload)
             matched = candidate_matches(selected, request_id, self.args.loose_response_match)
             last_response = Response(
@@ -1414,7 +1557,7 @@ class HarmonyUsbBridge:
                 request_json=request_json,
                 frames_written=len(frames),
                 raw_response_length=len(raw_response),
-                raw_response_hex=hex_string(bytes(raw_response)),
+                raw_response_hex=hex_string(raw_response),
                 read_reports=read_reports,
                 decode=decode,
                 payload_object=payload_object,
@@ -1474,26 +1617,222 @@ def raw_file_handle(response: RawResponse, what: str) -> int:
     return packet[5]
 
 
-def raw_open_write_file(bridge: HarmonyUsbBridge, remote_path: str, size: int | None, timeout_ms: int = 40000) -> int:
+def raw_file_size(response: RawResponse, what: str) -> int:
+    assert_raw_ok(response, what)
+    packet = bytes.fromhex(response.packet_hex)
+    if len(packet) <= 10:
+        return 0
+    return int.from_bytes(packet[7:11], "big")
+
+
+def raw_primary_packet_length(raw: bytes, offset: int) -> int:
+    if offset + 4 > len(raw):
+        return 0
+    pos = offset + 4
+    param_count = raw[offset + 3] & 0x3F
+    for _ in range(param_count):
+        if pos >= len(raw):
+            return 0
+        tag = raw[pos]
+        pos += 1
+        length = tag & 0x3F
+        if length == 0:
+            while pos < len(raw) and raw[pos] != 0:
+                pos += 1
+            if pos >= len(raw):
+                return 0
+            pos += 1
+        else:
+            pos += length
+            if pos > len(raw):
+                return 0
+    return pos - offset
+
+
+def raw_read_payload(raw: bytes, max_bytes: int, command_id: int = 0x04, sequence: int | None = None) -> tuple[bytes, bool]:
+    data = bytearray()
+    saw_end = False
+    pos = 0
+    if sequence is not None:
+        response_offset = find_raw_response_offset(raw, command_id, sequence)
+        if response_offset < 0:
+            return b"", False
+        response_length = raw_primary_packet_length(raw, response_offset)
+        if response_length <= 0:
+            return b"", False
+        pos = response_offset + response_length
+
+    while pos < len(raw):
+        while pos < len(raw) and raw[pos] == 0:
+            pos += 1
+        if pos >= len(raw):
+            break
+        if raw[pos] == 0xFE:
+            saw_end = True
+            break
+        if raw[pos] == 0xFF:
+            packet_length = raw_primary_packet_length(raw, pos)
+            pos += packet_length if packet_length > 0 else 1
+            continue
+        if pos + 2 > len(raw):
+            break
+        if max_bytes and len(data) >= max_bytes:
+            break
+        remaining = max_bytes - len(data) if max_bytes else 62
+        size = raw[pos + 1] & 0x3F
+        if size == 0:
+            size = min(62, remaining)
+        take = min(size, remaining)
+        if pos + 2 + take > len(raw):
+            break
+        data.extend(raw[pos + 2 : pos + 2 + take])
+        pos += 2 + size
+    return bytes(data), saw_end
+
+
+def raw_read_complete(raw: bytes, command_id: int, sequence: int, wanted_bytes: int) -> bool:
+    if not find_raw_response_packet(raw, command_id, sequence):
+        return False
+    data, saw_end = raw_read_payload(raw, wanted_bytes, command_id, sequence)
+    return saw_end or len(data) >= wanted_bytes
+
+
+def raw_open_read_file_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    remote_path: str,
+    timeout_ms: int = 40000,
+) -> tuple[int, int, RawResponse]:
+    response = bridge.raw_command_on_handle(handle, device, 0x01, [raw_param_string(remote_path), raw_param_string("R")], timeout_ms)
+    handle_id = raw_file_handle(response, f"open {remote_path}")
+    size = raw_file_size(response, f"open {remote_path}")
+    return handle_id, size, response
+
+
+def raw_open_write_file_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    remote_path: str,
+    size: int | None,
+    timeout_ms: int = 40000,
+) -> int:
     params = [raw_param_string(remote_path), raw_param_string("W")]
     param_count = 3
     if size is not None:
         params.append(raw_param_dword(size))
-    response = bridge.raw_command(0x01, params, timeout_ms, param_count=param_count)
+    response = bridge.raw_command_on_handle(handle, device, 0x01, params, timeout_ms, param_count=param_count)
     handle_id = raw_file_handle(response, f"open {remote_path}")
     print(f"Opened {remote_path}: handle={handle_id}", flush=True)
     return handle_id
 
 
-def raw_close_file(bridge: HarmonyUsbBridge, handle_id: int, label: str, timeout_ms: int = 30000) -> RawResponse:
-    response = bridge.raw_command(0x07, [raw_param_byte(handle_id)], timeout_ms)
+def raw_open_write_file(bridge: HarmonyUsbBridge, remote_path: str, size: int | None, timeout_ms: int = 40000) -> int:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_open_write_file_on_handle(bridge, handle, device, remote_path, size, timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_close_file_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    handle_id: int,
+    label: str,
+    timeout_ms: int = 30000,
+) -> RawResponse:
+    response = bridge.raw_command_on_handle(handle, device, 0x07, [raw_param_byte(handle_id)], timeout_ms)
     assert_raw_ok(response, f"close {label}")
     print(f"Closed {label}", flush=True)
     return response
 
 
-def raw_devctrl_checksum(bridge: HarmonyUsbBridge, handle_id: int, image: FirmwareImage, timeout_ms: int = 30000) -> RawResponse:
-    response = bridge.raw_command(
+def raw_close_file(bridge: HarmonyUsbBridge, handle_id: int, label: str, timeout_ms: int = 30000) -> RawResponse:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_close_file_on_handle(bridge, handle, device, handle_id, label, timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_read_file_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    remote_path: str,
+    packets_per_read: int,
+    open_timeout_ms: int = 40000,
+    read_timeout_ms: int = 25000,
+    close_timeout_ms: int = 30000,
+    max_bytes: int = 1024 * 1024,
+) -> RawFileRead:
+    if packets_per_read <= 0 or packets_per_read > 255:
+        raise UsbBridgeError(f"packets_per_read out of range: {packets_per_read}")
+    handle_id, size, open_response = raw_open_read_file_on_handle(bridge, handle, device, remote_path, open_timeout_ms)
+    if size > max_bytes:
+        raise UsbBridgeError(f"{remote_path} reports {size} bytes, refusing to read more than {max_bytes}.")
+    data = bytearray()
+    read_responses: list[RawResponse] = []
+    close_response: RawResponse | None = None
+    try:
+        while len(data) < size:
+            wanted = min(size - len(data), packets_per_read * 62)
+            sequence = bridge.new_raw_sequence()
+            frames = raw_primary_frames(0x04, sequence, [raw_param_byte(handle_id), raw_param_byte(packets_per_read)])
+            response = bridge.raw_exchange_on_handle(
+                handle,
+                device,
+                0x04,
+                frames,
+                sequence,
+                read_timeout_ms,
+                True,
+                None,
+                lambda raw, sequence=sequence, wanted=wanted: raw_read_complete(raw, 0x04, sequence, wanted),
+            )
+            assert_raw_ok(response, f"read {remote_path}")
+            chunk, saw_end = raw_read_payload(bytes.fromhex(response.raw_response_hex), wanted, 0x04, sequence)
+            if not chunk and not saw_end:
+                raise UsbBridgeError(f"read {remote_path} returned no data before EOF.")
+            data.extend(chunk)
+            read_responses.append(response)
+            if saw_end:
+                break
+    finally:
+        close_response = raw_close_file_on_handle(bridge, handle, device, handle_id, remote_path, close_timeout_ms)
+    return RawFileRead(
+        device_path=device.path,
+        remote_path=remote_path,
+        size=size,
+        data=bytes(data[:size]),
+        open_response=open_response,
+        read_responses=read_responses,
+        close_response=close_response,
+    )
+
+
+def raw_read_file(bridge: HarmonyUsbBridge, remote_path: str, packets_per_read: int, read_timeout_ms: int = 25000) -> RawFileRead:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_read_file_on_handle(bridge, handle, device, remote_path, packets_per_read, read_timeout_ms=read_timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_devctrl_checksum_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    handle_id: int,
+    image: FirmwareImage,
+    timeout_ms: int = 30000,
+) -> RawResponse:
+    response = bridge.raw_command_on_handle(
+        handle,
+        device,
         0x06,
         [
             raw_param_byte(handle_id),
@@ -1514,15 +1853,43 @@ def raw_devctrl_checksum(bridge: HarmonyUsbBridge, handle_id: int, image: Firmwa
     return response
 
 
-def raw_flush_firmware(bridge: HarmonyUsbBridge, handle_id: int, image_name: str, timeout_ms: int = 30000) -> RawResponse:
-    response = bridge.raw_command(0x05, [raw_param_byte(handle_id), raw_param_byte(0x00)], timeout_ms)
+def raw_devctrl_checksum(bridge: HarmonyUsbBridge, handle_id: int, image: FirmwareImage, timeout_ms: int = 30000) -> RawResponse:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_devctrl_checksum_on_handle(bridge, handle, device, handle_id, image, timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_flush_firmware_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    handle_id: int,
+    image_name: str,
+    timeout_ms: int = 30000,
+) -> RawResponse:
+    response = bridge.raw_command_on_handle(handle, device, 0x05, [raw_param_byte(handle_id), raw_param_byte(0x00)], timeout_ms)
     assert_raw_ok(response, f"commit firmware {image_name}")
     print(f"Committed firmware {image_name}", flush=True)
     return response
 
 
-def raw_reset_filesystem(bridge: HarmonyUsbBridge, timeout_ms: int = 30000) -> RawResponse:
-    response = bridge.raw_command(0xFF, [raw_param_byte(0x66)], timeout_ms)
+def raw_flush_firmware(bridge: HarmonyUsbBridge, handle_id: int, image_name: str, timeout_ms: int = 30000) -> RawResponse:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_flush_firmware_on_handle(bridge, handle, device, handle_id, image_name, timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_reset_filesystem_on_handle(
+    bridge: HarmonyUsbBridge,
+    handle: HidHandle,
+    device: DeviceInfo,
+    timeout_ms: int = 30000,
+) -> RawResponse:
+    response = bridge.raw_command_on_handle(handle, device, 0xFF, [raw_param_byte(0x66)], timeout_ms)
     assert_raw_ok(response, "reset firmware staging filesystem")
     packet = bytes.fromhex(response.packet_hex)
     if len(packet) <= 3 or packet[3] != 0x00:
@@ -1531,20 +1898,106 @@ def raw_reset_filesystem(bridge: HarmonyUsbBridge, timeout_ms: int = 30000) -> R
     return response
 
 
-def raw_reboot_device(bridge: HarmonyUsbBridge) -> RawResponse:
+def raw_reset_filesystem(bridge: HarmonyUsbBridge, timeout_ms: int = 30000) -> RawResponse:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_reset_filesystem_on_handle(bridge, handle, device, timeout_ms)
+    finally:
+        handle.close()
+
+
+def raw_reboot_device_on_handle(bridge: HarmonyUsbBridge, handle: HidHandle, device: DeviceInfo) -> RawResponse:
     sequence = bridge.new_raw_sequence()
     frames = raw_primary_frames(0xFF, sequence, [raw_param_byte(0x00)])
-    response = bridge.raw_exchange(0xFF, frames, sequence, 2000, expect_response=False)
+    response = bridge.raw_exchange_on_handle(handle, device, 0xFF, frames, sequence, 2000, expect_response=False)
     print("Sent reboot command", flush=True)
     return response
 
 
-def command_json_get(bridge: HarmonyUsbBridge, path: str, file_name: str) -> Response:
-    return bridge.invoke("connect.jsonfiletransfer?get", {"path": path, "file": file_name})
+def raw_reboot_device(bridge: HarmonyUsbBridge) -> RawResponse:
+    handle, device = bridge.open_handle()
+    try:
+        return raw_reboot_device_on_handle(bridge, handle, device)
+    finally:
+        handle.close()
 
 
-def command_json_put(bridge: HarmonyUsbBridge, path: str, file_name: str, content: Any) -> Response:
-    return bridge.invoke("connect.jsonfiletransfer?put", {"path": path, "file": file_name, "content": content})
+def decode_raw_text(data: bytes) -> str:
+    return data.rstrip(b"\x00").decode("utf-8", errors="replace")
+
+
+def parse_property_lines(text: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip("\x00")
+        if not line:
+            continue
+        if "," in line:
+            key, value = line.split(",", 1)
+        elif "=" in line:
+            key, value = line.split("=", 1)
+        else:
+            key, value = line, ""
+        rows.append({"key": key.strip(), "value": value.strip()})
+    return rows
+
+
+def property_map(rows: list[dict[str, str]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for row in rows:
+        key = row["key"]
+        value = row["value"]
+        if key in out:
+            if not isinstance(out[key], list):
+                out[key] = [out[key]]
+            out[key].append(value)
+        else:
+            out[key] = value
+    return out
+
+
+def redact_property_rows(rows: list[dict[str, str]], show_ssids: bool = False) -> list[dict[str, str]]:
+    redacted = []
+    for row in rows:
+        key = row["key"]
+        value = row["value"]
+        low = key.lower()
+        if low in {"password", "passphrase", "psk", "key"}:
+            value = "<redacted>"
+        elif low == "ssid" and not show_ssids:
+            value = "<ssid>"
+        redacted.append({"key": key, "value": value})
+    return redacted
+
+
+def raw_file_summary(read: RawFileRead, show_ssids: bool = False) -> dict[str, Any]:
+    text = decode_raw_text(read.data)
+    rows = parse_property_lines(text)
+    mapped = property_map(rows)
+    return {
+        "remotePath": read.remote_path,
+        "reportedSize": read.size,
+        "bytesRead": len(read.data),
+        "properties": redact(mapped, show_ssids),
+        "lines": redact_property_rows(rows, show_ssids),
+        "rawText": text if show_ssids else "<hidden; pass --show-ssids to print raw text>",
+    }
+
+
+def wifi_connect_payload(args: argparse.Namespace) -> bytes:
+    encryption = args.encryption.strip() or "WPA2-PSK"
+    rows = [
+        ("ssid", args.ssid.strip()),
+        ("password", args.wifi_password),
+        ("encryption", encryption),
+    ]
+    if args.no_save:
+        rows.append(("nosave", "true"))
+    text = "".join(f"{key},{value}\n" for key, value in rows)
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise UsbBridgeError("Wi-Fi properties could not be encoded as UTF-8.") from exc
 
 
 def command_log_put(bridge: HarmonyUsbBridge, file_name: str, body: str) -> Response:
@@ -1554,8 +2007,12 @@ def command_log_put(bridge: HarmonyUsbBridge, file_name: str, body: str) -> Resp
 def redact(obj: Any, show_ssids: bool = False, name: str = "") -> Any:
     low = name.lower()
     if low in {"password", "passphrase", "psk", "key"}:
+        if isinstance(obj, list):
+            return ["<redacted>" for _ in obj]
         return "<redacted>"
     if low == "ssid" and not show_ssids:
+        if isinstance(obj, list):
+            return ["<ssid>" for _ in obj]
         return "<ssid>"
     if isinstance(obj, dict):
         return {str(k): redact(v, show_ssids, str(k)) for k, v in obj.items()}
@@ -1638,139 +2095,6 @@ def empty_hid_read_hint(response: Response) -> dict[str, Any] | None:
     return hint
 
 
-def add_stage_file(files: list[StageFile], source: pathlib.Path, remote_path: str, mode: str, file_id: str) -> None:
-    if not source.is_file():
-        raise UsbBridgeError(f"Missing runtime file: {source}")
-    data = source.read_bytes()
-    files.append(
-        StageFile(
-            id=file_id,
-            source=str(source),
-            path=remote_path,
-            mode=mode,
-            bytes=len(data),
-            md5=md5_bytes(data),
-            data=base64.b64encode(data).decode("ascii"),
-        )
-    )
-
-
-def add_stage_bytes(files: list[StageFile], data: bytes, remote_path: str, mode: str, file_id: str, source: str) -> None:
-    files.append(
-        StageFile(
-            id=file_id,
-            source=source,
-            path=remote_path,
-            mode=mode,
-            bytes=len(data),
-            md5=md5_bytes(data),
-            data=base64.b64encode(data).decode("ascii"),
-        )
-    )
-
-
-def ensure_keypair(args: argparse.Namespace) -> None:
-    pub_path = resolve_local_path(args.public_key_file)
-    priv_path = resolve_local_path(args.private_key_file)
-    pub_path.parent.mkdir(parents=True, exist_ok=True)
-    priv_path.parent.mkdir(parents=True, exist_ok=True)
-    if pub_path.exists():
-        if priv_path.exists():
-            chmod_private_key(priv_path)
-        return
-    if priv_path.exists():
-        raise UsbBridgeError(f"Private key exists but public key is missing: {pub_path}. Restore the .pub file or choose another key path.")
-    ssh_keygen = shutil.which("ssh-keygen")
-    if not ssh_keygen:
-        raise UsbBridgeError("No public key was found and ssh-keygen is not available. Install OpenSSH or pass --public-key-file.")
-    print("Generating a local SSH keypair for this hub...")
-    subprocess.run([ssh_keygen, "-t", "ed25519", "-f", str(priv_path), "-N", "", "-C", "harmony-root-usb"], check=True)
-    chmod_private_key(priv_path)
-
-
-def chmod_private_key(path: pathlib.Path) -> None:
-    if os.name == "posix" and path.exists():
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-
-
-def new_owned_runtime_manifest(args: argparse.Namespace) -> dict[str, Any]:
-    files: list[StageFile] = []
-    root = resolve_local_path(args.package_root)
-    public_key = resolve_local_path(args.public_key_file)
-    dropbearmulti = root / "dropbearmulti"
-    add_stage_file(files, dropbearmulti, "/data/rootssh/bin/dropbearmulti", "755", "f001")
-    add_stage_file(files, public_key, "/home/root/.ssh/authorized_keys", "600", "f002")
-    add_stage_bytes(files, b'#!/bin/sh\nexec /data/rootssh/bin/dropbear -s -g -K 300 "$@"\n', "/usr/sbin/dropbear", "755", "f003", "dropbear-wrapper")
-    add_stage_bytes(files, b'#!/bin/sh\nexec /data/rootssh/bin/dropbearkey "$@"\n', "/usr/sbin/dropbearkey", "755", "f004", "dropbearkey-wrapper")
-    add_stage_bytes(files, b"1\n", "/etc/tdeenable", "644", "f005", "tde-marker")
-
-    manifest_files = []
-    for item in files:
-        chunks = math.ceil(len(item.data) / args.chunk_size)
-        manifest_files.append(
-            {
-                "id": item.id,
-                "path": item.path,
-                "mode": item.mode,
-                "bytes": item.bytes,
-                "md5": item.md5,
-                "chunks": chunks,
-            }
-        )
-    commands = [
-        "mkdir -p /data/rootssh/bin /etc/dropbear /home/root/.ssh",
-        "ln -sf dropbearmulti /data/rootssh/bin/dropbear",
-        "ln -sf dropbearmulti /data/rootssh/bin/dropbearkey",
-        "chmod 700 /home/root/.ssh",
-        "chmod 600 /home/root/.ssh/authorized_keys",
-        "chmod 755 /data/rootssh/bin/dropbearmulti /usr/sbin/dropbear /usr/sbin/dropbearkey",
-        "[ -f /etc/dropbear/dropbear_rsa_host_key ] || /usr/sbin/dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key",
-        "killall dropbear 2>/dev/null || true",
-        "/usr/sbin/dropbear -R -E -p 22",
-    ]
-    return {
-        "stage_files": files,
-        "manifest": {
-            "version": "rootssh-usb-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
-            "files": manifest_files,
-            "commands": commands,
-        },
-    }
-
-
-def owned_runtime_stage_summary(args: argparse.Namespace) -> dict[str, Any]:
-    if args.chunk_size < 1024 or args.chunk_size > 12000:
-        raise UsbBridgeError("--chunk-size should be between 1024 and 12000 to stay under LTCP limits.")
-    package = new_owned_runtime_manifest(args)
-    files_out = []
-    total_bytes = 0
-    total_chunks = 0
-    for item in package["stage_files"]:
-        chunks = math.ceil(len(item.data) / args.chunk_size)
-        total_bytes += item.bytes
-        total_chunks += chunks
-        files_out.append(
-            {
-                "id": item.id,
-                "source": item.source,
-                "path": item.path,
-                "mode": item.mode,
-                "bytes": item.bytes,
-                "base64Bytes": len(item.data),
-                "chunks": chunks,
-                "md5": item.md5,
-            }
-        )
-    return {
-        "chunkSize": args.chunk_size,
-        "fileCount": len(files_out),
-        "totalBytes": total_bytes,
-        "totalChunks": total_chunks,
-        "files": files_out,
-        "installerCommands": package["manifest"]["commands"],
-    }
-
-
 def tcp_port_open(address: str, port: int, timeout: float = 2.5) -> bool:
     try:
         with socket.create_connection((address, port), timeout=timeout):
@@ -1796,101 +2120,6 @@ def wait_hub_lan(args: argparse.Namespace) -> None:
     print(f"lan_port_{args.lan_port}_open={str(open_).lower()}")
 
 
-def test_root_ssh_login(args: argparse.Namespace) -> None:
-    if not args.hub_ip:
-        return
-    priv_path = resolve_local_path(args.private_key_file)
-    if not priv_path.exists():
-        print(f"WARNING: Private key not found for SSH verification: {priv_path}", file=sys.stderr)
-        return
-    chmod_private_key(priv_path)
-    ssh = shutil.which("ssh")
-    if not ssh:
-        print("WARNING: ssh executable not found; skipping login verification.", file=sys.stderr)
-        return
-    print(f"Waiting for Dropbear SSH on {args.hub_ip}:22...")
-    deadline = time.monotonic() + 75
-    open_ = False
-    while time.monotonic() < deadline:
-        if tcp_port_open(args.hub_ip, 22):
-            open_ = True
-            break
-        time.sleep(2)
-    print(f"ssh_port_22_open={str(open_).lower()}")
-    if not open_:
-        return
-    proc = subprocess.run(
-        [
-            ssh,
-            "-i",
-            str(priv_path),
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=8",
-            f"root@{args.hub_ip}",
-            "id; ps | grep '[d]ropbear'",
-        ],
-        check=False,
-    )
-    print(f"ssh_check_exit_code={proc.returncode}")
-
-
-def assert_usb_preflight_ready(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    if args.skip_preflight:
-        print("usb_preflight_skipped=true")
-        return
-    print("Running read-only USB preflight...")
-    sysinfo = bridge.invoke("sys.info", "", args.timeout_ms)
-    code = response_code(sysinfo)
-    if code != "200" or not sysinfo.matched_response or not sysinfo.decode.complete:
-        summary = {
-            "code": code,
-            "complete": sysinfo.decode.complete,
-            "matchedResponse": sysinfo.matched_response,
-            "appRequestId": sysinfo.app_request_id,
-            "attempt": sysinfo.attempt,
-            "attempts": sysinfo.attempts,
-            "error": sysinfo.decode.error,
-            "rawResponseLength": sysinfo.raw_response_length,
-            "candidates": sysinfo.candidate_decodes,
-        }
-        raise UsbBridgeError("USB preflight failed; not starting the requested USB action. Summary: " + compact_json(summary))
-    data = sysinfo.payload_object.get("data", {}) if isinstance(sysinfo.payload_object, dict) else {}
-    print(f"usb_preflight_ok=true fw={data.get('fw_ver', '')} attempt={sysinfo.attempt}/{sysinfo.attempts}")
-
-
-def install_root_access(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    pub_path = resolve_local_path(args.public_key_file)
-    if not pub_path.exists():
-        raise UsbBridgeError(f"Public key not found: {pub_path}")
-    public_key = pub_path.read_text(encoding="utf-8").strip()
-    print("Enabling TDE/root marker over USB...")
-    response = command_log_put(bridge, "../etc/tdeenable", "1\n")
-    assert_ok(response, "write /etc/tdeenable")
-
-    print("Creating root SSH key directories...")
-    response = command_json_put(bridge, "../../home/root/.ssh", "codex-dir-probe.json", {"created": now_epoch()})
-    assert_ok(response, "create /home/root/.ssh")
-    response = command_json_put(bridge, "../../etc/dropbear", "codex-dir-probe.json", {"created": now_epoch()})
-    assert_ok(response, "create /etc/dropbear")
-
-    print("Installing public key for root/dropbear...")
-    response = command_log_put(bridge, "../home/root/.ssh/authorized_keys", public_key + "\n")
-    assert_ok(response, "write /home/root/.ssh/authorized_keys")
-    response = command_log_put(bridge, "../etc/dropbear/authorized_keys", public_key + "\n")
-    assert_ok(response, "write /etc/dropbear/authorized_keys")
-
-    if args.reboot:
-        print("Requesting reboot so the root SSH path comes up cleanly...")
-        response = bridge.invoke("setup.firmware?reboot", {}, 2000)
-        write_response(response, args)
-
-
 def run_probe(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     devices = bridge.enumerate_devices()
     print(pretty_json([to_jsonable(device) for device in devices]))
@@ -1904,7 +2133,7 @@ def run_drain(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
 
 def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     _, device = bridge.get_device()
-    sysinfo = bridge.invoke("sys.info", "", args.timeout_ms)
+    sysinfo = raw_read_file(bridge, RAW_DEVICE_INFO_PATH, 50, max(args.timeout_ms, 25000))
     write_result = None
     if args.write_probe:
         write_result = command_log_put(bridge, "codex-usb-preflight.txt", "ok " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
@@ -1925,23 +2154,9 @@ def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
             "drainWaitMs": args.drain_wait_ms,
             "looseResponseMatch": args.loose_response_match,
         },
-        "sysinfo": {
-            "code": response_code(sysinfo),
-            "complete": sysinfo.decode.complete,
-            "matchedResponse": sysinfo.matched_response,
-            "appRequestId": sysinfo.app_request_id,
-            "attempt": sysinfo.attempt,
-            "attempts": sysinfo.attempts,
-            "error": sysinfo.decode.error,
-            "payload": sysinfo.payload_object,
-            "readReports": sysinfo.read_reports,
-            "candidates": sysinfo.candidate_decodes,
-        },
+        "sysinfo": raw_file_summary(sysinfo, args.show_ssids),
         "writeProbe": None,
     }
-    hint = empty_hid_read_hint(sysinfo)
-    if hint:
-        out["sysinfo"]["windowsHidHint"] = hint
     if write_result:
         out["writeProbe"] = {
             "code": response_code(write_result),
@@ -1957,24 +2172,18 @@ def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
 def run_resync(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     results = []
     for outer in range(1, args.resync_attempts + 1):
-        sysinfo = bridge.invoke("sys.info", "", args.timeout_ms)
+        sysinfo = raw_read_file(bridge, RAW_DEVICE_INFO_PATH, 50, max(args.timeout_ms, 25000))
         summary = {
-            "code": response_code(sysinfo),
-            "complete": sysinfo.decode.complete,
-            "matchedResponse": sysinfo.matched_response,
-            "appRequestId": sysinfo.app_request_id,
-            "attempt": sysinfo.attempt,
-            "attempts": sysinfo.attempts,
-            "error": sysinfo.decode.error,
-            "rawResponseLength": sysinfo.raw_response_length,
-            "readReportCount": len(sysinfo.read_reports),
-            "candidates": sysinfo.candidate_decodes,
+            "complete": len(sysinfo.data) == sysinfo.size,
+            "remotePath": sysinfo.remote_path,
+            "reportedSize": sysinfo.size,
+            "bytesRead": len(sysinfo.data),
+            "readCommands": len(sysinfo.read_responses),
             "outerAttempt": outer,
         }
         results.append(summary)
-        if response_code(sysinfo) == "200" and sysinfo.matched_response and sysinfo.decode.complete:
-            data = sysinfo.payload_object.get("data", {}) if isinstance(sysinfo.payload_object, dict) else {}
-            print(pretty_json({"ok": True, "outerAttempts": outer, "firmware": data.get("fw_ver"), "link": data.get("link_type"), "results": results}))
+        if len(sysinfo.data) == sysinfo.size:
+            print(pretty_json({"ok": True, "outerAttempts": outer, "sysinfo": raw_file_summary(sysinfo, args.show_ssids), "results": results}))
             return
         if outer < args.resync_attempts:
             time.sleep(max(0.1, args.retry_delay_ms / 1000.0))
@@ -1982,15 +2191,13 @@ def run_resync(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
 
 
 def run_wifi_status(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    response = bridge.invoke("wifi.status", {"donotresolve": 1}, max(args.timeout_ms, 10000))
-    write_response(response, args, redacted=True)
-    assert_ok(response, "wifi.status")
+    read = raw_read_file(bridge, RAW_WIFI_STATUS_PATH, 50, max(args.timeout_ms, 25000))
+    print(pretty_json(raw_file_summary(read, args.show_ssids)))
 
 
 def run_wifi_scan(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    response = bridge.invoke("wifi.networks", {}, max(args.timeout_ms, 60000))
-    write_response(response, args, redacted=True)
-    assert_ok(response, "wifi.networks")
+    read = raw_read_file(bridge, RAW_WIFI_NETWORKS_PATH, 100, max(args.timeout_ms, 60000))
+    print(pretty_json(raw_file_summary(read, args.show_ssids)))
 
 
 def ssid_label(args: argparse.Namespace) -> str:
@@ -2003,13 +2210,16 @@ def run_wifi_connect(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None
     encryption = args.encryption.strip() or "WPA2-PSK"
     if encryption.upper() not in {"NONE", "OPEN"} and args.wifi_password == "":
         raise UsbBridgeError("--wifi-password is required unless --encryption is NONE or OPEN.")
-    data: dict[str, Any] = {"ssid": args.ssid, "password": args.wifi_password, "encryption": encryption}
-    if args.no_save:
-        data["nosave"] = True
     print(f"Provisioning Wi-Fi over USB: ssid={ssid_label(args)} encryption={encryption} save={str(not args.no_save).lower()}")
-    response = bridge.invoke("wifi.connect", data, max(args.timeout_ms, 40000))
-    write_response(response, args, redacted=True)
-    assert_ok(response, "wifi.connect")
+    payload = wifi_connect_payload(args)
+    handle, device = bridge.open_handle()
+    try:
+        handle_id = raw_open_write_file_on_handle(bridge, handle, device, RAW_WIFI_CONNECT_PATH, len(payload), 60000)
+        bridge.raw_write_data_on_handle(handle, device, handle_id, payload, max(args.timeout_ms, 100000), packets_per_chunk=50, packet_count_width="byte", label=RAW_WIFI_CONNECT_PATH)
+        raw_close_file_on_handle(bridge, handle, device, handle_id, RAW_WIFI_CONNECT_PATH, 30000)
+    finally:
+        handle.close()
+    print(pretty_json({"ok": True, "action": "provision-wifi", "remotePath": RAW_WIFI_CONNECT_PATH, "bytesWritten": len(payload), "ssid": ssid_label(args), "encryption": encryption}))
     wait_hub_lan(args)
 
 
@@ -2031,13 +2241,17 @@ def run_factory_reset(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> Non
 
     require_destructive_confirmation(args, "Factory reset will erase the hub's local configuration and reboot it.")
 
-    handle_id = raw_open_write_file(bridge, "/sys/factoryreset", None)
-    bridge.raw_write_data(handle_id, b"1", 180000, packets_per_chunk=5, include_done=False, label="/sys/factoryreset")
-    raw_close_file(bridge, handle_id, "/sys/factoryreset")
+    handle, device = bridge.open_handle()
+    try:
+        handle_id = raw_open_write_file_on_handle(bridge, handle, device, "/sys/factoryreset", None)
+        bridge.raw_write_data_on_handle(handle, device, handle_id, b"1", 180000, packets_per_chunk=5, include_done=False, label="/sys/factoryreset")
+        raw_close_file_on_handle(bridge, handle, device, handle_id, "/sys/factoryreset")
 
-    handle_id = raw_open_write_file(bridge, "/sys/reboot", None)
-    bridge.raw_write_data(handle_id, b"reboot", 180000, packets_per_chunk=5, include_done=False, label="/sys/reboot")
-    raw_close_file(bridge, handle_id, "/sys/reboot", timeout_ms=180000)
+        handle_id = raw_open_write_file_on_handle(bridge, handle, device, "/sys/reboot", None)
+        bridge.raw_write_data_on_handle(handle, device, handle_id, b"reboot", 180000, packets_per_chunk=5, include_done=False, label="/sys/reboot")
+        raw_close_file_on_handle(bridge, handle, device, handle_id, "/sys/reboot", timeout_ms=180000)
+    finally:
+        handle.close()
 
     print(pretty_json({"ok": True, "action": "factory-reset", "reboot": True}))
 
@@ -2060,76 +2274,31 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
     require_destructive_confirmation(args, f"Firmware flash will write {bundle.path.name} to the hub and reboot it when requested by the bundle.")
 
     print(pretty_json({"validatedFirmware": summary}))
-    raw_reset_filesystem(bridge)
-    for image in bundle.images:
-        print(f"Flashing {image.name} to {image.remote_path} ({len(image.data)} bytes)", flush=True)
-        handle_id = raw_open_write_file(bridge, image.remote_path, len(image.data))
-        bridge.raw_write_data(
-            handle_id,
-            image.data,
-            30000,
-            packets_per_chunk=args.firmware_packets_per_chunk,
-            include_done=True,
-            label=image.name,
-        )
-        raw_devctrl_checksum(bridge, handle_id, image)
-        raw_flush_firmware(bridge, handle_id, image.name)
-        raw_close_file(bridge, handle_id, image.name)
+    handle, device = bridge.open_handle()
+    try:
+        raw_reset_filesystem_on_handle(bridge, handle, device)
+        for image in bundle.images:
+            print(f"Flashing {image.name} to {image.remote_path} ({len(image.data)} bytes)", flush=True)
+            handle_id = raw_open_write_file_on_handle(bridge, handle, device, image.remote_path, len(image.data))
+            bridge.raw_write_data_on_handle(
+                handle,
+                device,
+                handle_id,
+                image.data,
+                30000,
+                packets_per_chunk=args.firmware_packets_per_chunk,
+                include_done=True,
+                label=image.name,
+            )
+            raw_devctrl_checksum_on_handle(bridge, handle, device, handle_id, image)
+            raw_flush_firmware_on_handle(bridge, handle, device, handle_id, image.name)
+            raw_close_file_on_handle(bridge, handle, device, handle_id, image.name)
 
-    if any(image.reset for image in bundle.images):
-        raw_reboot_device(bridge)
+        if any(image.reset for image in bundle.images):
+            raw_reboot_device_on_handle(bridge, handle, device)
+    finally:
+        handle.close()
     print(pretty_json({"ok": True, "action": "flash-firmware", "images": [image.name for image in bundle.images], "reboot": any(image.reset for image in bundle.images)}))
-
-
-def install_usb_root_ssh(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    if args.chunk_size < 1024 or args.chunk_size > 12000:
-        raise UsbBridgeError("--chunk-size should be between 1024 and 12000 to stay under LTCP limits.")
-    ensure_keypair(args)
-    assert_usb_preflight_ready(bridge, args)
-    install_root_access(bridge, args)
-
-    print("Preparing staged USB root SSH package...")
-    package = new_owned_runtime_manifest(args)
-    plugin_source = resolve_local_path("rootsshusb.lua")
-    plugin_text = plugin_source.read_text(encoding="utf-8")
-    plugin_manifest = '{"plugin":"rootsshusb"}\n'
-
-    for directory in ("../../pkg/rootsshusb", "../../data/rootsshusb", "../../data/rootsshusb/chunks"):
-        response = command_json_put(bridge, directory, "codex-dir-probe.json", {"created": now_epoch()})
-        assert_ok(response, f"create {directory}")
-
-    print("Installing USB root SSH staging plugin...")
-    response = command_log_put(bridge, "../pkg/rootsshusb/manifest.json", plugin_manifest)
-    assert_ok(response, "write rootsshusb manifest")
-    response = command_log_put(bridge, "../pkg/rootsshusb/rootsshusb.lua", plugin_text)
-    assert_ok(response, "write rootsshusb plugin")
-
-    stage_files: list[StageFile] = package["stage_files"]
-    total_chunks = sum(math.ceil(len(item.data) / args.chunk_size) for item in stage_files)
-    sent = 0
-    for item in stage_files:
-        chunks = math.ceil(len(item.data) / args.chunk_size)
-        for index in range(chunks):
-            start = index * args.chunk_size
-            chunk = item.data[start : start + args.chunk_size]
-            remote = f"../data/rootsshusb/chunks/{item.id}.{index + 1}"
-            sent += 1
-            print(f"Uploading Harmony runtime over USB: {sent}/{total_chunks} chunks {item.path}", flush=True)
-            response = command_log_put(bridge, remote, chunk)
-            assert_ok(response, f"write chunk {remote}")
-        print(f"staged {item.path} bytes={item.bytes} chunks={chunks} md5={item.md5}")
-
-    manifest_json = compact_json(package["manifest"]) + "\n"
-    response = command_log_put(bridge, "../data/rootsshusb/manifest.json", manifest_json)
-    assert_ok(response, "write USB installer manifest")
-
-    print("Triggering hub-side installer...")
-    response = bridge.invoke("harmony.automation?discover", {"gatewayType": "rootsshusb"}, 30000)
-    print(f"installer_trigger_code={response_code(response)}")
-    time.sleep(2)
-    result = command_json_get(bridge, "../../data/rootsshusb", "result.json")
-    write_response(result, args)
-    test_root_ssh_login(args)
 
 
 def dry_run(args: argparse.Namespace) -> None:
@@ -2141,6 +2310,21 @@ def dry_run(args: argparse.Namespace) -> None:
             raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
         bundle = parse_hfw2_bundle(args.firmware_file)
         print(pretty_json({"dryRun": True, "action": "flash-firmware", "bundle": firmware_bundle_summary(bundle)}))
+        return
+
+    raw_action_paths = {
+        "preflight": RAW_DEVICE_INFO_PATH,
+        "resync": RAW_DEVICE_INFO_PATH,
+        "sysinfo": RAW_DEVICE_INFO_PATH,
+        "wifi-status": RAW_WIFI_STATUS_PATH,
+        "wifi-scan": RAW_WIFI_NETWORKS_PATH,
+    }
+    if args.action in raw_action_paths:
+        print(pretty_json({"dryRun": True, "action": args.action, "protocol": "raw-file", "remotePath": raw_action_paths[args.action], "steps": ["open", "read", "close"]}))
+        return
+    if args.action in {"wifi-connect", "provision-wifi"}:
+        payload = wifi_connect_payload(args) if args.ssid else b"ssid,<ssid>\npassword,<redacted>\nencryption,WPA2-PSK\n"
+        print(pretty_json({"dryRun": True, "action": args.action, "protocol": "raw-file", "remotePath": RAW_WIFI_CONNECT_PATH, "steps": ["open", "write", "close"], "bytes": len(payload)}))
         return
 
     sample_data: Any = ""
@@ -2178,6 +2362,9 @@ def self_test() -> None:
     assert decoded.payload == request, decoded.payload
     candidates = ltcp_candidates(raw)
     assert candidates and candidates[-1].complete
+    assert raw_param_string("R") == b"\x80R\x00"
+    assert raw_param_word(0x1234) == b"\x02\x34\x12"
+    assert raw_param_dword(0x12345678) == b"\x04\x78\x56\x34\x12"
     open_frames = raw_primary_frames(0x01, 0x22, [raw_param_string("/fw/otaupdate"), raw_param_string("W"), raw_param_dword(1234)])
     assert len(open_frames) == 1
     assert open_frames[0][:4] == bytes([0xFF, 0x01, 0x22, 0x03])
@@ -2206,11 +2393,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-drain", action="store_true")
     parser.add_argument("--loose-response-match", action="store_true")
     parser.add_argument("--write-probe", action="store_true")
-    parser.add_argument("--skip-preflight", action="store_true")
-    parser.add_argument("--public-key-file", default="keys/harmony_root_ed25519.pub")
-    parser.add_argument("--private-key-file", default="keys/harmony_root_ed25519")
     parser.add_argument("--hub-ip", default="")
-    parser.add_argument("--reboot", action="store_true")
     parser.add_argument("--ssid", default="")
     parser.add_argument("--wifi-password", default="")
     parser.add_argument("--encryption", default="WPA2-PSK")
@@ -2219,8 +2402,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-for-lan", action="store_true")
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
-    parser.add_argument("--package-root", default=".")
-    parser.add_argument("--chunk-size", type=int, default=8000)
     parser.add_argument("--firmware-file", default="")
     parser.add_argument("--target-skin", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
@@ -2229,6 +2410,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
+
+
+def run_action(args: argparse.Namespace) -> None:
+    bridge = HarmonyUsbBridge(args)
+    if args.action == "probe":
+        run_probe(bridge, args)
+    elif args.action == "drain":
+        run_drain(bridge, args)
+    elif args.action == "preflight":
+        run_preflight(bridge, args)
+    elif args.action == "resync":
+        run_resync(bridge, args)
+    elif args.action == "sysinfo":
+        read = raw_read_file(bridge, RAW_DEVICE_INFO_PATH, 50, max(args.timeout_ms, 25000))
+        print(pretty_json(raw_file_summary(read, args.show_ssids)))
+    elif args.action == "wifi-status":
+        run_wifi_status(bridge, args)
+    elif args.action == "wifi-scan":
+        run_wifi_scan(bridge, args)
+    elif args.action in {"wifi-connect", "provision-wifi"}:
+        run_wifi_connect(bridge, args)
+    elif args.action == "factory-reset":
+        run_factory_reset(bridge, args)
+    elif args.action == "flash-firmware":
+        run_flash_firmware(bridge, args)
+    else:
+        raise UsbBridgeError(f"Unknown action: {args.action}")
 
 
 def main() -> None:
@@ -2240,35 +2448,8 @@ def main() -> None:
         dry_run(args)
         return
 
-    bridge = HarmonyUsbBridge(args)
-    if args.action == "probe":
-        run_probe(bridge, args)
-    elif args.action == "drain":
-        run_drain(bridge, args)
-    elif args.action == "preflight":
-        run_preflight(bridge, args)
-    elif args.action == "resync":
-        run_resync(bridge, args)
-    elif args.action == "stage-summary":
-        ensure_keypair(args)
-        print(pretty_json(owned_runtime_stage_summary(args)))
-    elif args.action == "sysinfo":
-        response = bridge.invoke("sys.info", "", args.timeout_ms)
-        write_response(response, args)
-    elif args.action == "wifi-status":
-        run_wifi_status(bridge, args)
-    elif args.action == "wifi-scan":
-        run_wifi_scan(bridge, args)
-    elif args.action in {"wifi-connect", "provision-wifi"}:
-        run_wifi_connect(bridge, args)
-    elif args.action == "factory-reset":
-        run_factory_reset(bridge, args)
-    elif args.action == "flash-firmware":
-        run_flash_firmware(bridge, args)
-    elif args.action == "root-ssh":
-        install_usb_root_ssh(bridge, args)
-    else:
-        raise UsbBridgeError(f"Unknown action: {args.action}")
+    with usb_process_lock():
+        run_action(args)
 
 
 if __name__ == "__main__":

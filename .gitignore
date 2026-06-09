@@ -7,5 +7,8 @@ venv/
 *.log
 harmony_hub_id.txt
 harmony_hub_id.json
+.harmony_usb_bridge.lock
+hid_probe*.json
+usb_ltcp_probe*.json
 .DS_Store
 Thumbs.db

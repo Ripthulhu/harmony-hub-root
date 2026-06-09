@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-root-ssh", "usb-factory-reset", "usb-flash-firmware")]
+    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-factory-reset", "usb-flash-firmware")]
     [string]$Action = "",
 
     [string]$HubHost = "",
@@ -14,8 +14,6 @@ param(
     [switch]$NoShell,
     [switch]$DryRun,
 
-    [string]$PublicKeyFile = "",
-    [string]$PrivateKeyFile = "",
     [string]$Ssid = "",
     [string]$WifiPassword = "",
     [string]$Encryption = "WPA2-PSK",
@@ -61,13 +59,12 @@ function Read-ToolAction {
     Write-Host "5. Wi-Fi status over USB"
     Write-Host "6. Wi-Fi scan over USB"
     Write-Host "7. Provision Wi-Fi over USB"
-    Write-Host "8. USB root SSH install"
-    Write-Host "9. Factory reset over USB"
-    Write-Host "10. Flash firmware over USB (.hfw2)"
+    Write-Host "8. Factory reset over USB"
+    Write-Host "9. Flash firmware over USB (.hfw2)"
     Write-Host ""
 
     while ($true) {
-        $choice = Read-Host "Choose an action [1-10]"
+        $choice = Read-Host "Choose an action [1-9]"
         switch ($choice.Trim()) {
             "1" { return "lan-root" }
             "2" { return "enable-xmpp" }
@@ -76,10 +73,9 @@ function Read-ToolAction {
             "5" { return "usb-wifi-status" }
             "6" { return "usb-wifi-scan" }
             "7" { return "usb-provision-wifi" }
-            "8" { return "usb-root-ssh" }
-            "9" { return "usb-factory-reset" }
-            "10" { return "usb-flash-firmware" }
-            default { Write-Host "Enter a number from 1 to 10." }
+            "8" { return "usb-factory-reset" }
+            "9" { return "usb-flash-firmware" }
+            default { Write-Host "Enter a number from 1 to 9." }
         }
     }
 }
@@ -180,7 +176,6 @@ function Invoke-LanAction {
 function Invoke-UsbAction {
     param([string]$UsbAction)
 
-    $requiresPythonBackend = $UsbAction -in @("factory-reset", "flash-firmware")
     $python = Get-PythonInvocation
     $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
     if (-not (Test-Path -LiteralPath $tool)) {
@@ -195,21 +190,11 @@ function Invoke-UsbAction {
     $args.Add($tool)
     $args.Add("--action")
     $args.Add($UsbAction)
-    $args.Add("--package-root")
-    $args.Add(".")
     $args.Add("--backend")
     $args.Add($backend)
     if (-not [string]::IsNullOrWhiteSpace($HubIp)) {
         $args.Add("--hub-ip")
         $args.Add($HubIp)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($PublicKeyFile)) {
-        $args.Add("--public-key-file")
-        $args.Add($PublicKeyFile)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($PrivateKeyFile)) {
-        $args.Add("--private-key-file")
-        $args.Add($PrivateKeyFile)
     }
     if (-not [string]::IsNullOrWhiteSpace($Ssid)) {
         $args.Add("--ssid")
@@ -251,11 +236,7 @@ function Invoke-UsbAction {
         $args.Add("--dry-run")
     }
 
-    if ($requiresPythonBackend -and $UsbBackend -eq "native") {
-        Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction (required for raw firmware/reset protocol)"
-    } else {
-        Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
-    }
+    Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
     & $python.Exe @args
     if ($LASTEXITCODE -ne 0) {
         throw "USB action exited with code $LASTEXITCODE."
@@ -287,7 +268,7 @@ try {
             Invoke-UsbAction -UsbAction "wifi-status"
         }
         "usb-wifi-scan" {
-            if (-not $ShowSsids) {
+            if (-not $ShowSsids -and -not $DryRun -and -not $Yes) {
                 $answer = Read-Host "Show SSIDs in scan output? [y/N]"
                 if ($answer.Trim().ToLowerInvariant() -in @("y", "yes")) {
                     $ShowSsids = $true
@@ -306,7 +287,7 @@ try {
             if ($Encryption.ToUpperInvariant() -notin @("NONE", "OPEN") -and [string]::IsNullOrEmpty($WifiPassword)) {
                 $WifiPassword = Read-PlainSecret "Wi-Fi password"
             }
-            if (-not $WaitForLan) {
+            if (-not $WaitForLan -and -not $DryRun -and -not $Yes) {
                 $answer = Read-Host "Wait for LAN reachability after provisioning? [y/N]"
                 if ($answer.Trim().ToLowerInvariant() -in @("y", "yes")) {
                     $WaitForLan = $true
@@ -316,13 +297,6 @@ try {
                 $HubIp = Read-Host "Expected hub IP for LAN check"
             }
             Invoke-UsbAction -UsbAction "provision-wifi"
-        }
-        "usb-root-ssh" {
-            Resolve-HostAlias
-            if ([string]::IsNullOrWhiteSpace($HubIp)) {
-                $HubIp = Read-Host "Harmony Hub IP for optional SSH verification (leave blank to skip)"
-            }
-            Invoke-UsbAction -UsbAction "root-ssh"
         }
         "usb-factory-reset" {
             Invoke-UsbAction -UsbAction "factory-reset"

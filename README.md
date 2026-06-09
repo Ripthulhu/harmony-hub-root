@@ -55,9 +55,8 @@ You will see this menu:
 5. Wi-Fi status over USB
 6. Wi-Fi scan over USB
 7. Provision Wi-Fi over USB
-8. USB root SSH install
-9. Factory reset over USB
-10. Flash firmware over USB (.hfw2)
+8. Factory reset over USB
+9. Flash firmware over USB (.hfw2)
 ```
 
 ## What To Pick
@@ -68,9 +67,8 @@ You will see this menu:
 - Choose `4` to print hub info over USB.
 - Choose `5` or `6` to check Wi-Fi over USB.
 - Choose `7` to put the hub on Wi-Fi over USB, similar to MyHarmony setup.
-- Choose `8` for the USB root SSH path.
-- Choose `9` to factory reset the hub over USB.
-- Choose `10` to flash a Logitech `.hfw2` firmware bundle over USB.
+- Choose `8` to factory reset the hub over USB.
+- Choose `9` to flash a Logitech `.hfw2` firmware bundle over USB.
 
 If you are not sure where to start, use `3. USB preflight` for USB work or
 `2. Enable XMPP over LAN` for LAN work.
@@ -136,6 +134,10 @@ python3 run_harmony_hub_tool.py --action usb-flash-firmware --firmware-file "/pa
 
 Wi-Fi provisioning saves the network by default. Add `-NoSave` on PowerShell or
 `--no-save` with Python for a temporary connection.
+
+The USB actions use the same HID file protocol as MyHarmony. Sysinfo reads
+`/rf/deviceinfo`, Wi-Fi status reads `/sys/wifi/connect`, network scan reads
+`/sys/wifi/networks`, and provisioning writes `/sys/wifi/connect`.
 
 Factory reset and firmware flashing ask for confirmation before writing to the
 hub. For unattended use, add `-Yes` on PowerShell or `--yes` with Python.
@@ -231,11 +233,11 @@ there that launches the bundled Dropbear binary.
 If XMPP is off, the tool first tries to turn it on through the local WebSocket
 service on port `8088` by updating the hub's home automation config.
 
-The USB path uses the same hub-side APIs, but reaches them through the hub's USB
-HID interface instead of the LAN XMPP socket. The USB device is `046d:c129`, and
-normal commands are sent as LTCP-framed JSON, matching Logitech's desktop tools.
-Factory reset and firmware flashing use the lower-level LTCP file protocol from
-the MyHarmony USB templates.
+The USB path is for setup, recovery, and diagnostics. It reaches the hub through
+the USB HID interface instead of the LAN XMPP socket. The USB device is
+`046d:c129`, and the tool uses the lower-level LTCP file protocol from the
+MyHarmony USB templates for reads, Wi-Fi provisioning, factory reset, and
+firmware flashing.
 
 ## Troubleshooting
 
@@ -261,10 +263,8 @@ right, and your computer can reach the hub on the same network.
 - `run_harmony_hub_tool.py` - cross-platform runner
 - `run_harmony_hub_tool.sh` - Linux/macOS wrapper
 - `harmony_xmpp_root_shell.py` - LAN XMPP/HBus code
-- `harmony_usb_bridge.py` - cross-platform USB code
-- `harmony_usb_bridge.ps1` - legacy Windows USB bridge kept for reference
+- `harmony_usb_bridge.py` - cross-platform USB code used by the unified runner
 - `harmony_usb_hid_probe.ps1` - Windows HID probe
-- `rootsshusb.lua` - hub-side USB SSH installer
 - `dropbearmulti` - MIPS Dropbear binary
 - `requirements-usb.txt` - optional hidapi dependency
 - `SHA256SUMS.txt` - file hashes
