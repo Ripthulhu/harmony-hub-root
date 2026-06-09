@@ -177,151 +177,86 @@ function Invoke-LanAction {
     }
 }
 
-function Add-CommonUsbArgs {
-    param([System.Collections.Generic.List[string]]$Args)
-
-    if (-not [string]::IsNullOrWhiteSpace($HubIp)) {
-        $Args.Add("-HubIp")
-        $Args.Add($HubIp)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($PublicKeyFile)) {
-        $Args.Add("-PublicKeyFile")
-        $Args.Add($PublicKeyFile)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($PrivateKeyFile)) {
-        $Args.Add("-PrivateKeyFile")
-        $Args.Add($PrivateKeyFile)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Ssid)) {
-        $Args.Add("-Ssid")
-        $Args.Add($Ssid)
-    }
-    if (-not [string]::IsNullOrEmpty($WifiPassword)) {
-        $Args.Add("-WifiPassword")
-        $Args.Add($WifiPassword)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Encryption)) {
-        $Args.Add("-Encryption")
-        $Args.Add($Encryption)
-    }
-    if ($NoSave) {
-        $Args.Add("-NoSave")
-    }
-    if ($ShowSsids) {
-        $Args.Add("-ShowSsids")
-    }
-    if ($WaitForLan) {
-        $Args.Add("-WaitForLan")
-        $Args.Add("-LanPort")
-        $Args.Add([string]$LanPort)
-        $Args.Add("-LanWaitSeconds")
-        $Args.Add([string]$LanWaitSeconds)
-    }
-}
-
 function Invoke-UsbAction {
     param([string]$UsbAction)
 
     $requiresPythonBackend = $UsbAction -in @("factory-reset", "flash-firmware")
-    $usePythonBackend = $UsbBackend -ne "native" -or $requiresPythonBackend
-    if ($usePythonBackend) {
-        $python = Get-PythonInvocation
-        $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
-        if (-not (Test-Path -LiteralPath $tool)) {
-            throw "Missing Python USB bridge script: $tool"
-        }
-
-        $backend = if ($UsbBackend -in @("python", "native")) { "auto" } else { $UsbBackend }
-        $args = [System.Collections.Generic.List[string]]::new()
-        foreach ($arg in $python.Args) {
-            $args.Add($arg)
-        }
-        $args.Add($tool)
-        $args.Add("--action")
-        $args.Add($UsbAction)
-        $args.Add("--package-root")
-        $args.Add(".")
-        $args.Add("--backend")
-        $args.Add($backend)
-        if (-not [string]::IsNullOrWhiteSpace($HubIp)) {
-            $args.Add("--hub-ip")
-            $args.Add($HubIp)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($PublicKeyFile)) {
-            $args.Add("--public-key-file")
-            $args.Add($PublicKeyFile)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($PrivateKeyFile)) {
-            $args.Add("--private-key-file")
-            $args.Add($PrivateKeyFile)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($Ssid)) {
-            $args.Add("--ssid")
-            $args.Add($Ssid)
-        }
-        if (-not [string]::IsNullOrEmpty($WifiPassword)) {
-            $args.Add("--wifi-password")
-            $args.Add($WifiPassword)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($Encryption)) {
-            $args.Add("--encryption")
-            $args.Add($Encryption)
-        }
-        if ($NoSave) {
-            $args.Add("--no-save")
-        }
-        if ($ShowSsids) {
-            $args.Add("--show-ssids")
-        }
-        if ($WaitForLan) {
-            $args.Add("--wait-for-lan")
-            $args.Add("--lan-port")
-            $args.Add([string]$LanPort)
-            $args.Add("--lan-wait-seconds")
-            $args.Add([string]$LanWaitSeconds)
-        }
-        if (-not [string]::IsNullOrWhiteSpace($FirmwareFile)) {
-            $args.Add("--firmware-file")
-            $args.Add($FirmwareFile)
-        }
-        if ($FirmwarePacketsPerChunk -ne 500) {
-            $args.Add("--firmware-packets-per-chunk")
-            $args.Add([string]$FirmwarePacketsPerChunk)
-        }
-        if ($Yes) {
-            $args.Add("--yes")
-        }
-        if ($DryRun) {
-            $args.Add("--dry-run")
-        }
-
-        if ($requiresPythonBackend -and $UsbBackend -eq "native") {
-            Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction (required for raw firmware/reset protocol)"
-        } else {
-            Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
-        }
-        & $python.Exe @args
-        if ($LASTEXITCODE -ne 0) {
-            throw "USB action exited with code $LASTEXITCODE."
-        }
-        return
-    }
-
-    $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.ps1"
+    $python = Get-PythonInvocation
+    $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
     if (-not (Test-Path -LiteralPath $tool)) {
-        throw "Missing USB bridge script: $tool"
+        throw "Missing Python USB bridge script: $tool"
     }
 
+    $backend = if ($UsbBackend -in @("python", "native")) { "auto" } else { $UsbBackend }
     $args = [System.Collections.Generic.List[string]]::new()
-    $args.Add("-Action")
+    foreach ($arg in $python.Args) {
+        $args.Add($arg)
+    }
+    $args.Add($tool)
+    $args.Add("--action")
     $args.Add($UsbAction)
-    $args.Add("-PackageRoot")
+    $args.Add("--package-root")
     $args.Add(".")
-    Add-CommonUsbArgs -Args $args
+    $args.Add("--backend")
+    $args.Add($backend)
+    if (-not [string]::IsNullOrWhiteSpace($HubIp)) {
+        $args.Add("--hub-ip")
+        $args.Add($HubIp)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PublicKeyFile)) {
+        $args.Add("--public-key-file")
+        $args.Add($PublicKeyFile)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PrivateKeyFile)) {
+        $args.Add("--private-key-file")
+        $args.Add($PrivateKeyFile)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Ssid)) {
+        $args.Add("--ssid")
+        $args.Add($Ssid)
+    }
+    if (-not [string]::IsNullOrEmpty($WifiPassword)) {
+        $args.Add("--wifi-password")
+        $args.Add($WifiPassword)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Encryption)) {
+        $args.Add("--encryption")
+        $args.Add($Encryption)
+    }
+    if ($NoSave) {
+        $args.Add("--no-save")
+    }
+    if ($ShowSsids) {
+        $args.Add("--show-ssids")
+    }
+    if ($WaitForLan) {
+        $args.Add("--wait-for-lan")
+        $args.Add("--lan-port")
+        $args.Add([string]$LanPort)
+        $args.Add("--lan-wait-seconds")
+        $args.Add([string]$LanWaitSeconds)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FirmwareFile)) {
+        $args.Add("--firmware-file")
+        $args.Add($FirmwareFile)
+    }
+    if ($FirmwarePacketsPerChunk -ne 500) {
+        $args.Add("--firmware-packets-per-chunk")
+        $args.Add([string]$FirmwarePacketsPerChunk)
+    }
+    if ($Yes) {
+        $args.Add("--yes")
+    }
+    if ($DryRun) {
+        $args.Add("--dry-run")
+    }
 
-    Write-Host "Running Harmony Hub USB bridge action: $UsbAction"
-    $nativeArgs = $args.ToArray()
-    & $tool @nativeArgs
+    if ($requiresPythonBackend -and $UsbBackend -eq "native") {
+        Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction (required for raw firmware/reset protocol)"
+    } else {
+        Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
+    }
+    & $python.Exe @args
     if ($LASTEXITCODE -ne 0) {
         throw "USB action exited with code $LASTEXITCODE."
     }

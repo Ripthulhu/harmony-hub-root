@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import ctypes
 import dataclasses
 import errno
@@ -37,6 +38,13 @@ DEFAULT_VENDOR_ID = 0x046D
 DEFAULT_PRODUCT_ID = 0xC129
 DEFAULT_INPUT_REPORT_LENGTH = 65
 DEFAULT_OUTPUT_REPORT_LENGTH = 65
+WINDOWS_USB_OWNER_PROCESS_NAMES = {
+    "iexplore.exe",
+    "logipluginservice.exe",
+    "logipluginserviceext.exe",
+    "myharmony.exe",
+    "silverlight.configuration.exe",
+}
 ACTION_CHOICES = (
     "probe",
     "drain",
@@ -611,14 +619,15 @@ class WindowsHidApi:
         if not self.invalid_handle(handle):
             self.kernel32.CloseHandle(handle)
 
-    def open_path(self, path: str, desired_access: int) -> Any:
+    def open_path(self, path: str, desired_access: int, overlapped: bool = True) -> Any:
+        flags = self.FILE_FLAG_OVERLAPPED if overlapped else 0
         handle = self.kernel32.CreateFileW(
             path,
             desired_access,
             self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
             None,
             self.OPEN_EXISTING,
-            self.FILE_FLAG_OVERLAPPED,
+            flags,
             None,
         )
         if self.invalid_handle(handle):
@@ -723,7 +732,8 @@ class WindowsHidApi:
 class WindowsHidHandle(HidHandle):
     def __init__(self, api: WindowsHidApi, path: str) -> None:
         self._api = api
-        self._handle = api.open_path(path, api.GENERIC_READ | api.GENERIC_WRITE)
+        self._read_handle = api.open_path(path, api.GENERIC_READ, overlapped=True)
+        self._write_handle = api.open_path(path, api.GENERIC_WRITE, overlapped=False)
 
     def _overlapped_io(self, fn: Any, buffer: Any, length: int, timeout_ms: int) -> int:
         event = self._api.kernel32.CreateEventW(None, True, False, None)
@@ -733,17 +743,17 @@ class WindowsHidHandle(HidHandle):
         overlapped.hEvent = event
         transferred = ctypes.c_ulong(0)
         try:
-            ok = fn(self._handle, buffer, length, None, ctypes.byref(overlapped))
+            ok = fn(self._read_handle, buffer, length, None, ctypes.byref(overlapped))
             err = ctypes.get_last_error()
             if not ok and err != self._api.ERROR_IO_PENDING:
                 raise OSError(err, "HID overlapped I/O failed")
             if not ok:
                 wait = self._api.kernel32.WaitForSingleObject(event, max(1, timeout_ms))
                 if wait == self._api.WAIT_TIMEOUT:
-                    self._api.kernel32.CancelIoEx(self._handle, ctypes.byref(overlapped))
+                    self._api.kernel32.CancelIoEx(self._read_handle, ctypes.byref(overlapped))
                     self._api.kernel32.WaitForSingleObject(event, 1000)
                     cancel_ok = self._api.kernel32.GetOverlappedResult(
-                        self._handle,
+                        self._read_handle,
                         ctypes.byref(overlapped),
                         ctypes.byref(transferred),
                         False,
@@ -755,7 +765,7 @@ class WindowsHidHandle(HidHandle):
                     return 0
                 if wait != self._api.WAIT_OBJECT_0:
                     raise OSError(ctypes.get_last_error(), f"WaitForSingleObject failed: {wait}")
-            ok = self._api.kernel32.GetOverlappedResult(self._handle, ctypes.byref(overlapped), ctypes.byref(transferred), False)
+            ok = self._api.kernel32.GetOverlappedResult(self._read_handle, ctypes.byref(overlapped), ctypes.byref(transferred), False)
             if not ok:
                 raise OSError(ctypes.get_last_error(), "GetOverlappedResult failed")
             return int(transferred.value)
@@ -764,7 +774,11 @@ class WindowsHidHandle(HidHandle):
 
     def write(self, report: bytes) -> None:
         buffer = ctypes.create_string_buffer(report, len(report))
-        written = self._overlapped_io(self._api.kernel32.WriteFile, buffer, len(report), 5000)
+        written_value = ctypes.c_ulong(0)
+        ok = self._api.kernel32.WriteFile(self._write_handle, buffer, len(report), ctypes.byref(written_value), None)
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "HID synchronous write failed")
+        written = int(written_value.value)
         if written != len(report):
             raise OSError(f"short HID write: {written}/{len(report)}")
 
@@ -776,8 +790,10 @@ class WindowsHidHandle(HidHandle):
         return bytes(buffer.raw[:read])
 
     def close(self) -> None:
-        self._api.close_handle(self._handle)
-        self._handle = None
+        self._api.close_handle(self._read_handle)
+        self._api.close_handle(self._write_handle)
+        self._read_handle = None
+        self._write_handle = None
 
 
 class WindowsNativeBackend(HidBackend):
@@ -1551,7 +1567,7 @@ def redact(obj: Any, show_ssids: bool = False, name: str = "") -> Any:
 def response_summary(response: Response, raw_output: bool = False, show_ssids: bool = False) -> Any:
     payload = redact(response.payload_object, show_ssids) if show_ssids or response.payload_object else response.payload_object
     if raw_output or not response.payload_object:
-        return {
+        summary = {
             "command": response.command,
             "appRequestId": response.app_request_id,
             "attempt": response.attempt,
@@ -1567,6 +1583,10 @@ def response_summary(response: Response, raw_output: bool = False, show_ssids: b
             "readReports": response.read_reports,
             "candidates": response.candidate_decodes,
         }
+        hint = empty_hid_read_hint(response)
+        if hint:
+            summary["windowsHidHint"] = hint
+        return summary
     return payload
 
 
@@ -1575,6 +1595,47 @@ def write_response(response: Response, args: argparse.Namespace, redacted: bool 
     if redacted and not args.show_ssids:
         payload = redact(payload, False)
     print(pretty_json(payload))
+
+
+def windows_usb_owner_processes() -> list[str]:
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    names: set[str] = set()
+    for row in csv.reader(proc.stdout.splitlines()):
+        if not row:
+            continue
+        name = row[0].strip().lower()
+        if name in WINDOWS_USB_OWNER_PROCESS_NAMES:
+            names.add(row[0].strip())
+    return sorted(names, key=str.lower)
+
+
+def empty_hid_read_hint(response: Response) -> dict[str, Any] | None:
+    if not sys.platform.startswith("win"):
+        return None
+    if response.raw_response_length or response.read_reports:
+        return None
+
+    owners = windows_usb_owner_processes()
+    hint: dict[str, Any] = {
+        "message": "The hub opened over USB, but no HID input reports came back. Close MyHarmony, Edge IE-mode recovery pages, Internet Explorer, and Logitech plugin services, then reconnect the hub USB cable.",
+    }
+    if owners:
+        hint["possibleUsbOwnerProcesses"] = owners
+    return hint
 
 
 def add_stage_file(files: list[StageFile], source: pathlib.Path, remote_path: str, mode: str, file_id: str) -> None:
@@ -1878,6 +1939,9 @@ def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
         },
         "writeProbe": None,
     }
+    hint = empty_hid_read_hint(sysinfo)
+    if hint:
+        out["sysinfo"]["windowsHidHint"] = hint
     if write_result:
         out["writeProbe"] = {
             "code": response_code(write_result),

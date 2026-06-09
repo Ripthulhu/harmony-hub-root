@@ -246,6 +246,8 @@ If USB does not work:
 
 - run `usb-preflight` first
 - reconnect the hub
+- on Windows, close MyHarmony, Internet Explorer, Edge IE-mode recovery pages,
+  and Logitech plugin services before running USB actions
 - on Linux, check hidraw permissions or try `sudo`
 - on macOS, install `requirements-usb.txt`
 
@@ -260,7 +262,7 @@ right, and your computer can reach the hub on the same network.
 - `run_harmony_hub_tool.sh` - Linux/macOS wrapper
 - `harmony_xmpp_root_shell.py` - LAN XMPP/HBus code
 - `harmony_usb_bridge.py` - cross-platform USB code
-- `harmony_usb_bridge.ps1` - Windows USB code
+- `harmony_usb_bridge.ps1` - legacy Windows USB bridge kept for reference
 - `harmony_usb_hid_probe.ps1` - Windows HID probe
 - `rootsshusb.lua` - hub-side USB SSH installer
 - `dropbearmulti` - MIPS Dropbear binary
