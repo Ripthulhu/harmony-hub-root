@@ -87,6 +87,8 @@ The hub should already have completed normal first-time setup at least once.
 
 ## USB On Linux And macOS
 
+Windows uses a native HID backend and does not need hidapi.
+
 Linux can usually use `/dev/hidraw*` directly. If the tool finds the hub but
 cannot open it, run once with `sudo` or add a udev rule:
 
@@ -139,9 +141,10 @@ Factory reset and firmware flashing ask for confirmation before writing to the
 hub. For unattended use, add `-Yes` on PowerShell or `--yes` with Python.
 
 The flasher reads `Description.xml` inside the `.hfw2`, checks the local MD5,
-and refuses firmware that is not intended for SKIN `97` by default. Use
-`-TargetSkin` or `--target-skin` for another supported model. Use `-Force` or
-`--force` only when you have already checked the bundle yourself.
+detects the connected hub's SKIN over USB, and refuses firmware that is not
+intended for that SKIN. Use `-TargetSkin` or `--target-skin` if you need to
+validate a bundle without detection. Use `-Force` or `--force` only when you
+have already checked the bundle yourself.
 
 ## After LAN Root
 

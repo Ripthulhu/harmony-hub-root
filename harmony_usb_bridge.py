@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import dataclasses
 import errno
 import glob
@@ -439,6 +440,359 @@ class HidApiBackend(HidBackend):
         return HidApiHandle(self._hid, path)
 
 
+class WinGuid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class WinDeviceInterfaceData(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("InterfaceClassGuid", WinGuid),
+        ("Flags", ctypes.c_ulong),
+        ("Reserved", ctypes.c_void_p),
+    ]
+
+
+class WinHidAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Size", ctypes.c_ulong),
+        ("VendorID", ctypes.c_ushort),
+        ("ProductID", ctypes.c_ushort),
+        ("VersionNumber", ctypes.c_ushort),
+    ]
+
+
+class WinHidCaps(ctypes.Structure):
+    _fields_ = [
+        ("Usage", ctypes.c_ushort),
+        ("UsagePage", ctypes.c_ushort),
+        ("InputReportByteLength", ctypes.c_ushort),
+        ("OutputReportByteLength", ctypes.c_ushort),
+        ("FeatureReportByteLength", ctypes.c_ushort),
+        ("Reserved", ctypes.c_ushort * 17),
+        ("NumberLinkCollectionNodes", ctypes.c_ushort),
+        ("NumberInputButtonCaps", ctypes.c_ushort),
+        ("NumberInputValueCaps", ctypes.c_ushort),
+        ("NumberInputDataIndices", ctypes.c_ushort),
+        ("NumberOutputButtonCaps", ctypes.c_ushort),
+        ("NumberOutputValueCaps", ctypes.c_ushort),
+        ("NumberOutputDataIndices", ctypes.c_ushort),
+        ("NumberFeatureButtonCaps", ctypes.c_ushort),
+        ("NumberFeatureValueCaps", ctypes.c_ushort),
+        ("NumberFeatureDataIndices", ctypes.c_ushort),
+    ]
+
+
+class WinOverlapped(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", ctypes.c_ulong),
+        ("OffsetHigh", ctypes.c_ulong),
+        ("hEvent", ctypes.c_void_p),
+    ]
+
+
+class WindowsHidApi:
+    DIGCF_PRESENT = 0x00000002
+    DIGCF_DEVICEINTERFACE = 0x00000010
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    FILE_FLAG_OVERLAPPED = 0x40000000
+    ERROR_NO_MORE_ITEMS = 259
+    ERROR_OPERATION_ABORTED = 995
+    ERROR_IO_PENDING = 997
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    HIDP_STATUS_SUCCESS = 0x00110000
+
+    def __init__(self) -> None:
+        if not sys.platform.startswith("win"):
+            raise UsbBridgeError("Windows native HID backend is only available on Windows.")
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+        self.hid = ctypes.WinDLL("hid", use_last_error=True)
+        self._configure()
+
+    def _configure(self) -> None:
+        self.hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(WinGuid)]
+        self.hid.HidD_GetHidGuid.restype = None
+        self.hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(WinHidAttributes)]
+        self.hid.HidD_GetAttributes.restype = ctypes.c_bool
+        self.hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        self.hid.HidD_GetPreparsedData.restype = ctypes.c_bool
+        self.hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+        self.hid.HidD_FreePreparsedData.restype = ctypes.c_bool
+        self.hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(WinHidCaps)]
+        self.hid.HidP_GetCaps.restype = ctypes.c_ulong
+
+        self.setupapi.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(WinGuid),
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        self.setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+        self.setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(WinGuid),
+            ctypes.c_ulong,
+            ctypes.POINTER(WinDeviceInterfaceData),
+        ]
+        self.setupapi.SetupDiEnumDeviceInterfaces.restype = ctypes.c_bool
+        self.setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WinDeviceInterfaceData),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p,
+        ]
+        self.setupapi.SetupDiGetDeviceInterfaceDetailW.restype = ctypes.c_bool
+        self.setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+        self.setupapi.SetupDiDestroyDeviceInfoList.restype = ctypes.c_bool
+
+        self.kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+        self.kernel32.CreateFileW.restype = ctypes.c_void_p
+        self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.kernel32.CloseHandle.restype = ctypes.c_bool
+        self.kernel32.ReadFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(WinOverlapped),
+        ]
+        self.kernel32.ReadFile.restype = ctypes.c_bool
+        self.kernel32.WriteFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(WinOverlapped),
+        ]
+        self.kernel32.WriteFile.restype = ctypes.c_bool
+        self.kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+        self.kernel32.CreateEventW.restype = ctypes.c_void_p
+        self.kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        self.kernel32.GetOverlappedResult.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WinOverlapped),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_bool,
+        ]
+        self.kernel32.GetOverlappedResult.restype = ctypes.c_bool
+        self.kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.POINTER(WinOverlapped)]
+        self.kernel32.CancelIoEx.restype = ctypes.c_bool
+
+    @staticmethod
+    def invalid_handle(handle: Any) -> bool:
+        return handle is None or handle == 0 or handle == ctypes.c_void_p(-1).value
+
+    def close_handle(self, handle: Any) -> None:
+        if not self.invalid_handle(handle):
+            self.kernel32.CloseHandle(handle)
+
+    def open_path(self, path: str, desired_access: int) -> Any:
+        handle = self.kernel32.CreateFileW(
+            path,
+            desired_access,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_FLAG_OVERLAPPED,
+            None,
+        )
+        if self.invalid_handle(handle):
+            raise OSError(ctypes.get_last_error(), f"CreateFileW failed for {path}")
+        return handle
+
+    def enumerate(self, vendor_id: int, product_id: int) -> list[DeviceInfo]:
+        needle = f"vid_{vendor_id:04x}&pid_{product_id:04x}"
+        guid = WinGuid()
+        self.hid.HidD_GetHidGuid(ctypes.byref(guid))
+        devs = self.setupapi.SetupDiGetClassDevsW(
+            ctypes.byref(guid),
+            None,
+            None,
+            self.DIGCF_PRESENT | self.DIGCF_DEVICEINTERFACE,
+        )
+        if self.invalid_handle(devs):
+            raise OSError(ctypes.get_last_error(), "SetupDiGetClassDevsW failed")
+
+        devices: list[DeviceInfo] = []
+        try:
+            index = 0
+            while True:
+                iface = WinDeviceInterfaceData()
+                iface.cbSize = ctypes.sizeof(WinDeviceInterfaceData)
+                ok = self.setupapi.SetupDiEnumDeviceInterfaces(devs, None, ctypes.byref(guid), index, ctypes.byref(iface))
+                if not ok:
+                    err = ctypes.get_last_error()
+                    if err == self.ERROR_NO_MORE_ITEMS:
+                        break
+                    raise OSError(err, "SetupDiEnumDeviceInterfaces failed")
+                index += 1
+
+                required = ctypes.c_ulong(0)
+                self.setupapi.SetupDiGetDeviceInterfaceDetailW(devs, ctypes.byref(iface), None, 0, ctypes.byref(required), None)
+                if not required.value:
+                    continue
+                detail = ctypes.create_string_buffer(required.value)
+                ctypes.c_ulong.from_buffer(detail).value = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+                ok = self.setupapi.SetupDiGetDeviceInterfaceDetailW(
+                    devs,
+                    ctypes.byref(iface),
+                    ctypes.cast(detail, ctypes.c_void_p),
+                    required.value,
+                    ctypes.byref(required),
+                    None,
+                )
+                if not ok:
+                    continue
+                path = ctypes.wstring_at(ctypes.addressof(detail) + 4)
+                if needle not in path.lower():
+                    continue
+                devices.append(self.device_info_from_path(path, vendor_id, product_id))
+        finally:
+            self.setupapi.SetupDiDestroyDeviceInfoList(devs)
+        return devices
+
+    def device_info_from_path(self, path: str, vendor_id: int, product_id: int) -> DeviceInfo:
+        try:
+            handle = self.open_path(path, 0)
+        except OSError:
+            return DeviceInfo(backend="winhid", path=path, vendor_id=vendor_id, product_id=product_id)
+        try:
+            attrs = WinHidAttributes()
+            attrs.Size = ctypes.sizeof(WinHidAttributes)
+            dev_vendor = vendor_id
+            dev_product = product_id
+            if self.hid.HidD_GetAttributes(handle, ctypes.byref(attrs)):
+                dev_vendor = int(attrs.VendorID)
+                dev_product = int(attrs.ProductID)
+
+            input_len = DEFAULT_INPUT_REPORT_LENGTH
+            output_len = DEFAULT_OUTPUT_REPORT_LENGTH
+            usage_page = None
+            usage = None
+            prep = ctypes.c_void_p()
+            if self.hid.HidD_GetPreparsedData(handle, ctypes.byref(prep)):
+                try:
+                    caps = WinHidCaps()
+                    status = self.hid.HidP_GetCaps(prep, ctypes.byref(caps))
+                    if status == self.HIDP_STATUS_SUCCESS:
+                        input_len = int(caps.InputReportByteLength) or DEFAULT_INPUT_REPORT_LENGTH
+                        output_len = int(caps.OutputReportByteLength) or DEFAULT_OUTPUT_REPORT_LENGTH
+                        usage_page = int(caps.UsagePage)
+                        usage = int(caps.Usage)
+                finally:
+                    self.hid.HidD_FreePreparsedData(prep)
+            return DeviceInfo(
+                backend="winhid",
+                path=path,
+                vendor_id=dev_vendor,
+                product_id=dev_product,
+                input_report_length=input_len,
+                output_report_length=output_len,
+                usage_page=usage_page,
+                usage=usage,
+            )
+        finally:
+            self.close_handle(handle)
+
+
+class WindowsHidHandle(HidHandle):
+    def __init__(self, api: WindowsHidApi, path: str) -> None:
+        self._api = api
+        self._handle = api.open_path(path, api.GENERIC_READ | api.GENERIC_WRITE)
+
+    def _overlapped_io(self, fn: Any, buffer: Any, length: int, timeout_ms: int) -> int:
+        event = self._api.kernel32.CreateEventW(None, True, False, None)
+        if self._api.invalid_handle(event):
+            raise OSError(ctypes.get_last_error(), "CreateEventW failed")
+        overlapped = WinOverlapped()
+        overlapped.hEvent = event
+        transferred = ctypes.c_ulong(0)
+        try:
+            ok = fn(self._handle, buffer, length, None, ctypes.byref(overlapped))
+            err = ctypes.get_last_error()
+            if not ok and err != self._api.ERROR_IO_PENDING:
+                raise OSError(err, "HID overlapped I/O failed")
+            if not ok:
+                wait = self._api.kernel32.WaitForSingleObject(event, max(1, timeout_ms))
+                if wait == self._api.WAIT_TIMEOUT:
+                    self._api.kernel32.CancelIoEx(self._handle, ctypes.byref(overlapped))
+                    self._api.kernel32.WaitForSingleObject(event, 1000)
+                    cancel_ok = self._api.kernel32.GetOverlappedResult(
+                        self._handle,
+                        ctypes.byref(overlapped),
+                        ctypes.byref(transferred),
+                        False,
+                    )
+                    if not cancel_ok:
+                        err = ctypes.get_last_error()
+                        if err != self._api.ERROR_OPERATION_ABORTED:
+                            raise OSError(err, "cancelled HID overlapped I/O failed")
+                    return 0
+                if wait != self._api.WAIT_OBJECT_0:
+                    raise OSError(ctypes.get_last_error(), f"WaitForSingleObject failed: {wait}")
+            ok = self._api.kernel32.GetOverlappedResult(self._handle, ctypes.byref(overlapped), ctypes.byref(transferred), False)
+            if not ok:
+                raise OSError(ctypes.get_last_error(), "GetOverlappedResult failed")
+            return int(transferred.value)
+        finally:
+            self._api.close_handle(event)
+
+    def write(self, report: bytes) -> None:
+        buffer = ctypes.create_string_buffer(report, len(report))
+        written = self._overlapped_io(self._api.kernel32.WriteFile, buffer, len(report), 5000)
+        if written != len(report):
+            raise OSError(f"short HID write: {written}/{len(report)}")
+
+    def read(self, length: int, timeout_ms: int) -> bytes:
+        buffer = ctypes.create_string_buffer(length)
+        read = self._overlapped_io(self._api.kernel32.ReadFile, buffer, length, timeout_ms)
+        if read <= 0:
+            return b""
+        return bytes(buffer.raw[:read])
+
+    def close(self) -> None:
+        self._api.close_handle(self._handle)
+        self._handle = None
+
+
+class WindowsNativeBackend(HidBackend):
+    name = "winhid"
+
+    def __init__(self) -> None:
+        self._api = WindowsHidApi()
+
+    def enumerate(self, vendor_id: int, product_id: int) -> list[DeviceInfo]:
+        return self._api.enumerate(vendor_id, product_id)
+
+    def open(self, device: DeviceInfo) -> HidHandle:
+        return WindowsHidHandle(self._api, device.path)
+
+
 class HidrawHandle(HidHandle):
     def __init__(self, path: str) -> None:
         self._fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
@@ -523,11 +877,18 @@ def make_backends(name: str) -> list[HidBackend]:
         return [HidApiBackend()]
     if name == "hidraw":
         return [LinuxHidrawBackend()]
+    if name == "winhid":
+        return [WindowsNativeBackend()]
     backends: list[HidBackend] = []
     try:
         backends.append(HidApiBackend())
     except UsbBridgeError:
         pass
+    if sys.platform.startswith("win"):
+        try:
+            backends.append(WindowsNativeBackend())
+        except UsbBridgeError:
+            pass
     backends.append(LinuxHidrawBackend())
     return backends
 
@@ -1617,16 +1978,40 @@ def run_factory_reset(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> Non
     print(pretty_json({"ok": True, "action": "factory-reset", "reboot": True}))
 
 
-def validate_firmware_target(bundle: FirmwareBundle, args: argparse.Namespace) -> None:
-    if args.target_skin <= 0:
+def parse_skin_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+    except ValueError:
+        return None
+
+
+def detect_hub_skin(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> int | None:
+    response = bridge.invoke("sys.info", "", max(args.timeout_ms, 12000))
+    if response_code(response) != "200" or not isinstance(response.payload_object, dict):
+        return None
+    data = response.payload_object.get("data", {})
+    if not isinstance(data, dict):
+        return None
+    return parse_skin_value(data.get("skin"))
+
+
+def validate_firmware_target(bundle: FirmwareBundle, target_skin: int | None, force: bool) -> None:
+    if not target_skin or target_skin <= 0:
         return
-    if args.target_skin in bundle.intended_skins:
+    if target_skin in bundle.intended_skins:
         return
-    if args.force:
+    if force:
         return
     raise UsbBridgeError(
         f"firmware bundle is intended for skins {bundle.intended_skins}, "
-        f"but --target-skin is {args.target_skin}. Use --force only if you are certain."
+        f"but target skin is {target_skin}. Use --force only if you are certain."
     )
 
 
@@ -1634,10 +2019,14 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
     if not args.firmware_file.strip():
         raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
     bundle = parse_hfw2_bundle(args.firmware_file)
-    validate_firmware_target(bundle, args)
+    detected_skin = detect_hub_skin(bridge, args)
+    target_skin = args.target_skin or detected_skin
+    if not target_skin and not args.force:
+        raise UsbBridgeError("could not detect hub skin over USB; pass --target-skin or use --force if you have verified the bundle.")
+    validate_firmware_target(bundle, target_skin, args.force)
     summary = firmware_bundle_summary(bundle)
     if args.dry_run:
-        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": args.target_skin, "bundle": summary}))
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": target_skin, "detectedSkin": detected_skin, "bundle": summary}))
         return
 
     for image in bundle.images:
@@ -1648,7 +2037,7 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
 
     require_destructive_confirmation(args, f"Firmware flash will write {bundle.path.name} to the hub and reboot it when requested by the bundle.")
 
-    print(pretty_json({"validatedFirmware": summary, "targetSkin": args.target_skin}))
+    print(pretty_json({"validatedFirmware": summary, "targetSkin": target_skin, "detectedSkin": detected_skin}))
     raw_reset_filesystem(bridge)
     for image in bundle.images:
         print(f"Flashing {image.name} to {image.remote_path} ({len(image.data)} bytes)", flush=True)
@@ -1729,8 +2118,9 @@ def dry_run(args: argparse.Namespace) -> None:
         if not args.firmware_file.strip():
             raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
         bundle = parse_hfw2_bundle(args.firmware_file)
-        validate_firmware_target(bundle, args)
-        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": args.target_skin, "bundle": firmware_bundle_summary(bundle)}))
+        target_skin = args.target_skin or None
+        validate_firmware_target(bundle, target_skin, args.force)
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": target_skin, "detectedSkin": None, "bundle": firmware_bundle_summary(bundle)}))
         return
 
     sample_data: Any = ""
@@ -1782,11 +2172,11 @@ def self_test() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Harmony Hub USB HID/LTCP bridge")
     parser.add_argument("--action", choices=ACTION_CHOICES, default="preflight")
-    parser.add_argument("--backend", choices=("auto", "hidapi", "hidraw"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "hidapi", "hidraw", "winhid"), default="auto")
     parser.add_argument("--device-path", default="")
     parser.add_argument("--vendor-id", default="046D")
     parser.add_argument("--product-id", default="C129")
-    parser.add_argument("--timeout-ms", type=int, default=5000)
+    parser.add_argument("--timeout-ms", type=int, default=12000)
     parser.add_argument("--retry-count", type=int, default=2)
     parser.add_argument("--retry-delay-ms", type=int, default=250)
     parser.add_argument("--drain-reports", type=int, default=32)
@@ -1812,7 +2202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-root", default=".")
     parser.add_argument("--chunk-size", type=int, default=8000)
     parser.add_argument("--firmware-file", default="")
-    parser.add_argument("--target-skin", type=int, default=97)
+    parser.add_argument("--target-skin", type=int, default=0)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--force", action="store_true")

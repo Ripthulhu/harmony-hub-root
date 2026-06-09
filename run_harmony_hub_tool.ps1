@@ -25,11 +25,11 @@ param(
     [int]$LanPort = 8088,
     [int]$LanWaitSeconds = 90,
     [string]$FirmwareFile = "",
-    [int]$TargetSkin = 97,
+    [int]$TargetSkin = 0,
     [int]$FirmwarePacketsPerChunk = 500,
     [switch]$Yes,
     [switch]$Force,
-    [ValidateSet("auto", "native", "python", "hidapi", "hidraw")]
+    [ValidateSet("auto", "native", "python", "hidapi", "hidraw", "winhid")]
     [string]$UsbBackend = "auto",
 
     [switch]$PauseOnExit
@@ -223,7 +223,7 @@ function Invoke-UsbAction {
     param([string]$UsbAction)
 
     $requiresPythonBackend = $UsbAction -in @("factory-reset", "flash-firmware")
-    if ($UsbBackend -in @("python", "hidapi", "hidraw") -or $requiresPythonBackend) {
+    if ($UsbBackend -in @("python", "hidapi", "hidraw", "winhid") -or $requiresPythonBackend) {
         $python = Get-PythonInvocation
         $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
         if (-not (Test-Path -LiteralPath $tool)) {
