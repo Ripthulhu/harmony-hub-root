@@ -1978,55 +1978,13 @@ def run_factory_reset(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> Non
     print(pretty_json({"ok": True, "action": "factory-reset", "reboot": True}))
 
 
-def parse_skin_value(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
-    except ValueError:
-        return None
-
-
-def detect_hub_skin(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> int | None:
-    response = bridge.invoke("sys.info", "", max(args.timeout_ms, 12000))
-    if response_code(response) != "200" or not isinstance(response.payload_object, dict):
-        return None
-    data = response.payload_object.get("data", {})
-    if not isinstance(data, dict):
-        return None
-    return parse_skin_value(data.get("skin"))
-
-
-def validate_firmware_target(bundle: FirmwareBundle, target_skin: int | None, force: bool) -> None:
-    if not target_skin or target_skin <= 0:
-        return
-    if target_skin in bundle.intended_skins:
-        return
-    if force:
-        return
-    raise UsbBridgeError(
-        f"firmware bundle is intended for skins {bundle.intended_skins}, "
-        f"but target skin is {target_skin}. Use --force only if you are certain."
-    )
-
-
 def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     if not args.firmware_file.strip():
         raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
     bundle = parse_hfw2_bundle(args.firmware_file)
-    detected_skin = detect_hub_skin(bridge, args)
-    target_skin = args.target_skin or detected_skin
-    if not target_skin and not args.force:
-        raise UsbBridgeError("could not detect hub skin over USB; pass --target-skin or use --force if you have verified the bundle.")
-    validate_firmware_target(bundle, target_skin, args.force)
     summary = firmware_bundle_summary(bundle)
     if args.dry_run:
-        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": target_skin, "detectedSkin": detected_skin, "bundle": summary}))
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "bundle": summary}))
         return
 
     for image in bundle.images:
@@ -2037,7 +1995,7 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
 
     require_destructive_confirmation(args, f"Firmware flash will write {bundle.path.name} to the hub and reboot it when requested by the bundle.")
 
-    print(pretty_json({"validatedFirmware": summary, "targetSkin": target_skin, "detectedSkin": detected_skin}))
+    print(pretty_json({"validatedFirmware": summary}))
     raw_reset_filesystem(bridge)
     for image in bundle.images:
         print(f"Flashing {image.name} to {image.remote_path} ({len(image.data)} bytes)", flush=True)
@@ -2118,9 +2076,7 @@ def dry_run(args: argparse.Namespace) -> None:
         if not args.firmware_file.strip():
             raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
         bundle = parse_hfw2_bundle(args.firmware_file)
-        target_skin = args.target_skin or None
-        validate_firmware_target(bundle, target_skin, args.force)
-        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": target_skin, "detectedSkin": None, "bundle": firmware_bundle_summary(bundle)}))
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "bundle": firmware_bundle_summary(bundle)}))
         return
 
     sample_data: Any = ""
@@ -2202,10 +2158,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-root", default=".")
     parser.add_argument("--chunk-size", type=int, default=8000)
     parser.add_argument("--firmware-file", default="")
-    parser.add_argument("--target-skin", type=int, default=0)
+    parser.add_argument("--target-skin", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
     parser.add_argument("--yes", action="store_true")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()

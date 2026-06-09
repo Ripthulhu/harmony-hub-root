@@ -283,19 +283,12 @@ function Invoke-UsbAction {
             $args.Add("--firmware-file")
             $args.Add($FirmwareFile)
         }
-        if ($TargetSkin -gt 0) {
-            $args.Add("--target-skin")
-            $args.Add([string]$TargetSkin)
-        }
         if ($FirmwarePacketsPerChunk -ne 500) {
             $args.Add("--firmware-packets-per-chunk")
             $args.Add([string]$FirmwarePacketsPerChunk)
         }
         if ($Yes) {
             $args.Add("--yes")
-        }
-        if ($Force) {
-            $args.Add("--force")
         }
         if ($DryRun) {
             $args.Add("--dry-run")

@@ -140,11 +140,10 @@ Wi-Fi provisioning saves the network by default. Add `-NoSave` on PowerShell or
 Factory reset and firmware flashing ask for confirmation before writing to the
 hub. For unattended use, add `-Yes` on PowerShell or `--yes` with Python.
 
-The flasher reads `Description.xml` inside the `.hfw2`, checks the local MD5,
-detects the connected hub's SKIN over USB, and refuses firmware that is not
-intended for that SKIN. Use `-TargetSkin` or `--target-skin` if you need to
-validate a bundle without detection. Use `-Force` or `--force` only when you
-have already checked the bundle yourself.
+The flasher reads `Description.xml` inside the `.hfw2` to find the firmware
+image, remote path, checksum command, and reboot flag. It does not try to detect
+the connected hub's SKIN and it does not block firmware based on `INTENDED/SKIN`
+metadata.
 
 ## After LAN Root
 

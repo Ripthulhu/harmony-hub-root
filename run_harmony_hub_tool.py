@@ -139,14 +139,10 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
         argv += ["--wait-for-lan", "--lan-port", str(args.lan_port), "--lan-wait-seconds", str(args.lan_wait_seconds)]
     if args.firmware_file:
         argv += ["--firmware-file", args.firmware_file]
-    if args.target_skin:
-        argv += ["--target-skin", str(args.target_skin)]
     if args.firmware_packets_per_chunk != 500:
         argv += ["--firmware-packets-per-chunk", str(args.firmware_packets_per_chunk)]
     if args.yes:
         argv.append("--yes")
-    if args.force:
-        argv.append("--force")
     if args.dry_run:
         argv.append("--dry-run")
     return argv
@@ -209,10 +205,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
     parser.add_argument("--firmware-file", default="")
-    parser.add_argument("--target-skin", type=int, default=0)
+    parser.add_argument("--target-skin", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
     parser.add_argument("--yes", action="store_true")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
