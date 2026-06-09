@@ -1,7 +1,9 @@
-# Harmony Hub LAN Root SSH Tool
+# Harmony Hub Root Tools
 
-For an owned Logitech Harmony Hub on the same LAN as your computer. The tool
-gains root access, installs Dropbear, and starts persistent SSH access.
+For an owned Logitech Harmony Hub. The LAN tool gains root access through the
+local XMPP/HBus chain, installs Dropbear, and starts persistent SSH access. The
+USB tool talks to the hub's MyHarmony-style HID/LTCP bridge for read-only
+preflight, Wi-Fi provisioning, and USB root SSH installation.
 
 ## Files
 
@@ -9,6 +11,11 @@ gains root access, installs Dropbear, and starts persistent SSH access.
 - `run_xmpp_root_shell.ps1` - PowerShell wrapper
 - `run_xmpp_root_shell.sh` - Linux/macOS shell wrapper
 - `harmony_xmpp_root_shell.py` - LAN installer
+- `Start_USB_Root_Tool.cmd` - double-click USB launcher with prompts
+- `run_usb_root_ssh.ps1` - USB PowerShell runner
+- `harmony_usb_root_ssh.ps1` - USB installer and Wi-Fi provisioner
+- `harmony_usb_hid_probe.ps1` - Windows HID enumerator used by the USB tool
+- `rootsshusb.lua` - temporary hub-side USB installer
 - `dropbearmulti` - MIPS Dropbear binary for Harmony Hub
 - `SHA256SUMS.txt` - integrity hashes
 
@@ -17,15 +24,17 @@ gains root access, installs Dropbear, and starts persistent SSH access.
 - Windows 10/11, Linux, or macOS
 - Python 3.10 or newer
 - OpenSSH client tools: `ssh` and `ssh-keygen`
-- Harmony Hub IP address
-- PC and hub on the same LAN
-- The hub has completed normal first-time setup in the Harmony phone app
-- XMPP/local network control is enabled in the Harmony phone app
+- For LAN rooting: Harmony Hub IP address, PC and hub on the same LAN, and the
+  hub completed normal first-time setup in the Harmony phone app.
+- For USB actions: Windows PowerShell and a USB cable connected to the hub.
+- For LAN rooting, local hub control must be reachable. If XMPP on `5222` is
+  disabled, the tool will try to turn it on through the hub's `8088` WebSocket
+  config path.
 
-## Run
+## LAN Root Over XMPP
 
 Finish setup in the Harmony phone app first. The hub must already be joined to
-Wi-Fi, linked to the app, and reachable on the local network with XMPP enabled.
+Wi-Fi, linked to the app, and reachable on the local network.
 
 ### Windows
 
@@ -56,6 +65,20 @@ Or call Python directly:
 ```bash
 python3 harmony_xmpp_root_shell.py --host <hub-ip>
 ```
+
+If the tool cannot infer the hub ID while XMPP is disabled, pass a known ID:
+
+```bash
+python3 harmony_xmpp_root_shell.py --host <hub-ip> --hub-id <numeric-id>
+```
+
+To only enable XMPP and skip the root install:
+
+```bash
+python3 harmony_xmpp_root_shell.py --host <hub-ip> --enable-xmpp-only
+```
+
+The XMPP-enable preflight can be skipped with `--no-enable-xmpp`.
 
 The tool creates or reuses an SSH key at:
 
@@ -91,6 +114,51 @@ installer:
 The Hub ID is required by Harmony's local WebSocket/HBus API. Do not substitute
 a guessed value.
 
+## USB Root And Wi-Fi
+
+The USB path is useful when the hub is physically connected and you want to
+preflight the MyHarmony HID bridge, inspect/provision Wi-Fi, or install root SSH
+without relying on XMPP first.
+
+Double-click on Windows:
+
+```text
+Start_USB_Root_Tool.cmd
+```
+
+Or open PowerShell in the repository root:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\run_usb_root_ssh.ps1
+```
+
+Both paths show an interactive menu:
+
+```text
+1. Install root SSH
+2. USB preflight
+3. USB sysinfo
+4. Wi-Fi status over USB
+5. Wi-Fi scan over USB
+6. Provision Wi-Fi over USB
+```
+
+Manual examples:
+
+```powershell
+.\harmony_usb_root_ssh.ps1 -Action preflight
+.\harmony_usb_root_ssh.ps1 -Action wifi-status
+.\harmony_usb_root_ssh.ps1 -Action wifi-scan -ShowSsids
+.\harmony_usb_root_ssh.ps1 -Action provision-wifi -Ssid "<ssid>" -WifiPassword "<password>" -Encryption "WPA2-PSK"
+.\harmony_usb_root_ssh.ps1 -Action root-ssh -HubIp "<hub-ip>"
+```
+
+`provision-wifi` persists by default, matching MyHarmony's `savewifinetwork`
+flow. Add `-NoSave` for a temporary association. Password input from the
+interactive runner is hidden by PowerShell and is not written to disk by the
+runner.
+
 ## Tested Firmware
 
 This tool was tested on Logitech Harmony Hub firmware `4.15.600`.
@@ -99,8 +167,11 @@ This tool was tested on Logitech Harmony Hub firmware `4.15.600`.
 
 This is a LAN-only post-setup exploit chain. It depends on the hub already being
 provisioned through the Harmony phone app because normal setup joins the hub to
-Wi-Fi and enables Logitech's local XMPP/HBus control interface. Without that
-local service, there is nothing on the network for this tool to talk to.
+Wi-Fi and exposes Logitech's local HBus control interface. If XMPP is disabled,
+the tool first attempts the same developer-option toggle used by the Harmony
+mobile setup bundle: it writes `enableXMPP = 1` to
+`dynamite://HomeAutomationService/Config/` through `proxy.resource?get` and
+`proxy.resource?put` on the local WebSocket service.
 
 The chain works because several legacy/debug features trust each other too much:
 
@@ -182,10 +253,10 @@ local XMPP access
   -> install and start persistent Dropbear SSH
 ```
 
-The exploit fails if the hub is not fully set up, if XMPP/local network control
-is disabled, if the PC cannot reach the hub on the LAN, or if the firmware has
-patched either the log-write traversal or the TDE-gated automation/file-transfer
-behavior.
+The exploit fails if the hub is not fully set up, if neither XMPP nor the local
+WebSocket config path is reachable, if the PC cannot reach the hub on the LAN,
+or if the firmware has patched either the log-write traversal or the TDE-gated
+automation/file-transfer behavior.
 
 ## What It Installs
 

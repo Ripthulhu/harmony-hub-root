@@ -3,6 +3,10 @@ param(
   [string]$PrivateKey,
   [string]$PubKey,
   [string]$Dropbearmulti,
+  [string[]]$HubId,
+  [int]$XmppEnableWait = 90,
+  [switch]$NoEnableXmpp,
+  [switch]$EnableXmppOnly,
   [switch]$NoShell,
   [switch]$DryRun,
   [switch]$PauseOnExit
@@ -59,6 +63,20 @@ try {
   if ($HubHost) {
     $args += @("--host", $HubHost)
   }
+  foreach ($id in @($HubId)) {
+    if ($id) {
+      $args += @("--hub-id", $id)
+    }
+  }
+  if ($XmppEnableWait -ne 90) {
+    $args += @("--xmpp-enable-wait", [string]$XmppEnableWait)
+  }
+  if ($NoEnableXmpp) {
+    $args += "--no-enable-xmpp"
+  }
+  if ($EnableXmppOnly) {
+    $args += "--enable-xmpp-only"
+  }
   if ($NoShell) {
     $args += "--no-shell"
   }
@@ -66,7 +84,7 @@ try {
     $args += "--dry-run"
   }
 
-  Write-Host "Running original XMPP LAN root shell installer..."
+  Write-Host "Running Harmony Hub LAN root shell installer..."
   & $exe @args
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0) {

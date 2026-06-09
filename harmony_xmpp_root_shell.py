@@ -41,6 +41,7 @@ DEFAULT_HBUS_PORT = 8088
 DEFAULT_SSH_PORT = 22
 DEFAULT_DOMAIN = "svcs.myharmony.com"
 DEFAULT_CHUNK_SIZE = 1400
+XMPP_AUTOMATION_CONFIG_URI = "dynamite://HomeAutomationService/Config/"
 LUA_CHUNK_SIZE = 512
 ELF_MACHINES = {8: "MIPS", 40: "ARM"}
 
@@ -376,6 +377,31 @@ def response_preview(obj: Any, limit: int = 500) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=True)[:limit]
 
 
+def response_data(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if "data" in obj and any(key in obj for key in ("code", "errorcode", "errorCode", "cmd", "command")):
+            return obj["data"]
+        for value in obj.values():
+            found = response_data(value)
+            if found is not None:
+                return found
+    if isinstance(obj, list):
+        for value in obj:
+            found = response_data(value)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_json_if_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
 def extract_numeric_ids(text: str) -> list[str]:
     ids: list[str] = []
     for pattern in [
@@ -388,6 +414,42 @@ def extract_numeric_ids(text: str) -> list[str]:
             value = match.group(1)
             if value not in ids:
                 ids.append(value)
+    return ids
+
+
+def load_saved_hub_ids(host: str) -> list[str]:
+    ids: list[str] = []
+
+    def add(value: object) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if re.fullmatch(r"\d{4,}", text) and text not in ids:
+            ids.append(text)
+
+    candidates = [
+        pathlib.Path.home() / ".harmony-hub" / "known_hubs.json",
+        pathlib.Path.home() / ".harmony-hub" / "last_root.json",
+        SCRIPT_DIR / "harmony_hub_id.json",
+        SCRIPT_DIR / "harmony_hub_id.txt",
+    ]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            if path.suffix == ".txt":
+                add(path.read_text(encoding="utf-8").strip())
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if path.name == "known_hubs.json" and isinstance(data, dict):
+            host_data = data.get(host)
+            if isinstance(host_data, dict):
+                add(host_data.get("hub_id"))
+            continue
+        if isinstance(data, dict):
+            add(data.get("hub_id"))
     return ids
 
 
@@ -420,6 +482,125 @@ def discover_hub_ids_http(host: str, port: int) -> list[str]:
             if value not in ids:
                 ids.append(value)
     return ids
+
+
+def is_port_open(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def automation_resource_from_response(response: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    data = parse_json_if_string(response_data(response))
+    if not isinstance(data, dict):
+        return None, {}
+    resource = parse_json_if_string(data.get("resource"))
+    if not isinstance(resource, dict):
+        return None, data
+    return resource, data
+
+
+def automation_put_params(resource: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    params: dict[str, Any] = {"uri": XMPP_AUTOMATION_CONFIG_URI, "resource": resource}
+    if data.get("hetag") is not None:
+        params["hetag"] = data.get("hetag")
+    elif data.get("heTag") is not None:
+        params["hetag"] = data.get("heTag")
+    return params
+
+
+def enable_xmpp_with_websocket(
+    host: str,
+    hbus_port: int,
+    domain: str,
+    hub_ids: list[str],
+    xmpp_port: int,
+    wait_s: int,
+) -> bool:
+    if is_port_open(host, xmpp_port):
+        print(f"xmpp_port_{xmpp_port}_open=true")
+        return True
+    if not hub_ids:
+        print("xmpp_enable_candidates=none")
+        print("Could not infer a hub ID for the 8088 WebSocket preflight. Re-run with --hub-id <id>.")
+        return False
+
+    print("xmpp_port_open_before_enable=false")
+    print("xmpp_enable_candidates=" + ",".join(hub_ids))
+    for hub_id in hub_ids:
+        print(f"Trying to enable XMPP through WebSocket hub id {hub_id}...")
+        try:
+            ws = WebSocketTransport(host, hub_id, hbus_port, domain)
+            get_resp = ws.call("proxy.resource?get", {"uri": XMPP_AUTOMATION_CONFIG_URI}, 30)
+        except Exception as exc:  # noqa: BLE001
+            print(f"proxy.resource?get failed for hub id {hub_id}: {exc}")
+            continue
+
+        get_code = response_code(get_resp)
+        print(f"proxy.resource?get code={get_code or '?'} preview={response_preview(get_resp)}")
+        if get_code and get_code != "200":
+            continue
+
+        resource, data = automation_resource_from_response(get_resp)
+        if resource is None:
+            print("Automation config response did not include a parseable resource; trying next hub id.")
+            continue
+
+        old_value = resource.get("enableXMPP")
+        resource["enableXMPP"] = 1
+        params = automation_put_params(resource, data)
+
+        try:
+            put_resp = ws.call("proxy.resource?put", params, 45)
+        except Exception as exc:  # noqa: BLE001
+            print(f"proxy.resource?put failed for hub id {hub_id}: {exc}")
+            continue
+        put_code = response_code(put_resp)
+        print(
+            "proxy.resource?put enableXMPP "
+            f"{old_value!r}->1 code={put_code or '?'} preview={response_preview(put_resp)}"
+        )
+        if put_code == "412":
+            latest_resource, latest_data = automation_resource_from_response(put_resp)
+            if latest_resource is None:
+                continue
+            conflict_value = latest_resource.get("enableXMPP")
+            latest_resource["enableXMPP"] = 1
+            try:
+                put_resp = ws.call("proxy.resource?put", automation_put_params(latest_resource, latest_data), 45)
+            except Exception as exc:  # noqa: BLE001
+                print(f"proxy.resource?put conflict retry failed for hub id {hub_id}: {exc}")
+                continue
+            put_code = response_code(put_resp)
+            print(
+                "proxy.resource?put conflict retry enableXMPP "
+                f"{conflict_value!r}->1 code={put_code or '?'} preview={response_preview(put_resp)}"
+            )
+        if put_code and put_code not in ("200", "204"):
+            continue
+
+        print(f"Waiting up to {wait_s}s for XMPP on {host}:{xmpp_port}...")
+        if wait_for_port(host, xmpp_port, wait_s):
+            print("xmpp_port_open_after_enable=true")
+            return True
+        print("XMPP did not open inside the wait window for this hub id.")
+    return False
+
+
+def collect_xmpp_enable_hub_ids(host: str, hbus_port: int, cli_hub_ids: list[str] | None) -> list[str]:
+    hub_ids: list[str] = []
+    for value in cli_hub_ids or []:
+        if value and value not in hub_ids:
+            hub_ids.append(value)
+    for value in load_saved_hub_ids(host):
+        if value not in hub_ids:
+            hub_ids.append(value)
+    for value in discover_hub_ids_http(host, hbus_port):
+        if value not in hub_ids:
+            hub_ids.append(value)
+    return hub_ids
 
 
 def resolve_input_path(value: str) -> pathlib.Path:
@@ -1057,11 +1238,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xmpp-port", type=int, default=DEFAULT_XMPP_PORT)
     parser.add_argument("--hbus-port", type=int, default=DEFAULT_HBUS_PORT)
     parser.add_argument("--domain", default=DEFAULT_DOMAIN)
+    parser.add_argument(
+        "--hub-id",
+        action="append",
+        help="Known numeric hub ID for the 8088 XMPP-enable preflight. Can be passed more than once.",
+    )
     parser.add_argument("--dropbearmulti", default="dropbearmulti")
     parser.add_argument("--private-key", default=str(default_key_path()))
     parser.add_argument("--pubkey", help="Public key to install. Default: <private-key>.pub")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--ssh-wait", type=int, default=120)
+    parser.add_argument(
+        "--xmpp-enable-wait",
+        type=int,
+        default=90,
+        help="Seconds to wait for port 5222 after toggling enableXMPP over 8088. Default: 90.",
+    )
+    parser.add_argument(
+        "--no-enable-xmpp",
+        action="store_true",
+        help="Do not try the 8088 automation-config preflight when XMPP is closed.",
+    )
+    parser.add_argument(
+        "--enable-xmpp-only",
+        action="store_true",
+        help="Try to enable XMPP over 8088, then exit without installing root SSH.",
+    )
     parser.add_argument("--package-name", help="Temporary package name. Default: fresh random name.")
     parser.add_argument("--no-shell", action="store_true", help="Install/start Dropbear but do not launch interactive SSH.")
     parser.add_argument("--dry-run", action="store_true", help="Validate local payload only; do not contact the hub.")
@@ -1078,6 +1280,32 @@ def main() -> None:
         host = input("Harmony Hub IP address: ").strip()
     if not host and not args.dry_run:
         raise SystemExit("hub IP is required")
+    if args.xmpp_enable_wait < 5:
+        raise SystemExit("--xmpp-enable-wait must be at least 5 seconds")
+
+    if args.enable_xmpp_only:
+        if args.no_enable_xmpp:
+            raise SystemExit("--enable-xmpp-only conflicts with --no-enable-xmpp")
+        if args.dry_run:
+            print("dry_run=true")
+            info("Dry run complete: no network calls were made.")
+            return
+        step("Enable XMPP Only")
+        info("Trying the Harmony app's automation-config toggle over 8088, then exiting.")
+        if not enable_xmpp_with_websocket(
+            host,
+            args.hbus_port,
+            args.domain,
+            collect_xmpp_enable_hub_ids(host, args.hbus_port, args.hub_id),
+            args.xmpp_port,
+            args.xmpp_enable_wait,
+        ):
+            raise SystemExit(
+                "XMPP is not reachable and the 8088 enableXMPP preflight did not open it. "
+                "Try passing --hub-id <id>, or enable XMPP once in the Harmony app."
+            )
+        info("XMPP enable-only run complete.")
+        return
 
     dropbearmulti = resolve_input_path(args.dropbearmulti)
     private_key = pathlib.Path(args.private_key).expanduser()
@@ -1112,6 +1340,22 @@ def main() -> None:
         print("dry_run=true")
         info("Dry run complete: local payload is valid and no network calls were made.")
         return
+
+    if not args.no_enable_xmpp:
+        step("XMPP Availability")
+        info("If port 5222 is closed, the tool will try the Harmony app's automation-config toggle over 8088.")
+        if not enable_xmpp_with_websocket(
+            host,
+            args.hbus_port,
+            args.domain,
+            collect_xmpp_enable_hub_ids(host, args.hbus_port, args.hub_id),
+            args.xmpp_port,
+            args.xmpp_enable_wait,
+        ):
+            raise SystemExit(
+                "XMPP is not reachable and the 8088 enableXMPP preflight did not open it. "
+                "Try passing --hub-id <id>, or enable XMPP once in the Harmony app."
+            )
 
     step("Connecting To Hub")
     info(f"Opening local XMPP API at {host}:{args.xmpp_port}.")
