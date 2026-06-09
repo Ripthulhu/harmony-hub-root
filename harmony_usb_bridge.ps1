@@ -1,6 +1,6 @@
 param(
     [ValidateSet("probe", "drain", "preflight", "resync", "stage-summary", "root-ssh", "sysinfo", "wifi-status", "wifi-scan", "wifi-connect", "provision-wifi")]
-    [string]$Action = "root-ssh",
+    [string]$Action = "preflight",
 
     [string]$ProbeFile = "hid_probe.json",
     [string]$VendorId = "046D",
@@ -1016,7 +1016,7 @@ function Assert-UsbPreflightReady {
             rawResponseLength = $sys.RawResponseLength
             candidates = $sys.CandidateDecodes
         } | ConvertTo-Json -Compress -Depth 8
-        throw "USB preflight failed; not starting flash. Replug USB or restart the hub USB bridge, then retry. Summary: $summary"
+        throw "USB preflight failed; not starting the requested USB action. Replug USB or restart the hub USB bridge, then retry. Summary: $summary"
     }
     Write-Host ("usb_preflight_ok=true fw={0} attempt={1}/{2}" -f $sys.PayloadObject.data.fw_ver, $sys.Attempt, $sys.Attempts)
 }
@@ -1194,7 +1194,7 @@ function Invoke-UsbWifiConnect {
     Wait-HubLanPort
 }
 
-function Flash-OwnedRuntime {
+function Install-UsbRootSsh {
     if ($ChunkSize -lt 1024 -or $ChunkSize -gt 12000) {
         throw "-ChunkSize should be between 1024 and 12000 to stay under LTCP limits."
     }
@@ -1292,6 +1292,6 @@ switch ($Action) {
         Invoke-UsbWifiConnect
     }
     "root-ssh" {
-        Flash-OwnedRuntime
+        Install-UsbRootSsh
     }
 }
