@@ -223,7 +223,8 @@ function Invoke-UsbAction {
     param([string]$UsbAction)
 
     $requiresPythonBackend = $UsbAction -in @("factory-reset", "flash-firmware")
-    if ($UsbBackend -in @("python", "hidapi", "hidraw", "winhid") -or $requiresPythonBackend) {
+    $usePythonBackend = $UsbBackend -ne "native" -or $requiresPythonBackend
+    if ($usePythonBackend) {
         $python = Get-PythonInvocation
         $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
         if (-not (Test-Path -LiteralPath $tool)) {
@@ -319,7 +320,8 @@ function Invoke-UsbAction {
     Add-CommonUsbArgs -Args $args
 
     Write-Host "Running Harmony Hub USB bridge action: $UsbAction"
-    & $tool @args
+    $nativeArgs = $args.ToArray()
+    & $tool @nativeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "USB action exited with code $LASTEXITCODE."
     }
