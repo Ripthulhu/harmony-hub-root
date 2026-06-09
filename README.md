@@ -1,3 +1,5 @@
+# USB support is work in progress and pretty broken
+
 # Harmony Hub Root
 
 Tools for an owned Logitech Harmony Hub.
