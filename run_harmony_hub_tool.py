@@ -22,6 +22,8 @@ ACTION_CHOICES = (
     "usb-wifi-scan",
     "usb-provision-wifi",
     "usb-root-ssh",
+    "usb-factory-reset",
+    "usb-flash-firmware",
 )
 
 
@@ -36,6 +38,8 @@ def read_action() -> str:
     print("6. Wi-Fi scan over USB")
     print("7. Provision Wi-Fi over USB")
     print("8. USB root SSH install")
+    print("9. Factory reset over USB")
+    print("10. Flash firmware over USB (.hfw2)")
     print("")
     mapping = {
         "1": "lan-root",
@@ -46,12 +50,14 @@ def read_action() -> str:
         "6": "usb-wifi-scan",
         "7": "usb-provision-wifi",
         "8": "usb-root-ssh",
+        "9": "usb-factory-reset",
+        "10": "usb-flash-firmware",
     }
     while True:
-        choice = input("Choose an action [1-8]: ").strip()
+        choice = input("Choose an action [1-10]: ").strip()
         if choice in mapping:
             return mapping[choice]
-        print("Enter a number from 1 to 8.")
+        print("Enter a number from 1 to 10.")
 
 
 def resolve_host_alias(args: argparse.Namespace) -> None:
@@ -131,6 +137,16 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
         argv.append("--show-ssids")
     if args.wait_for_lan:
         argv += ["--wait-for-lan", "--lan-port", str(args.lan_port), "--lan-wait-seconds", str(args.lan_wait_seconds)]
+    if args.firmware_file:
+        argv += ["--firmware-file", args.firmware_file]
+    if args.target_skin:
+        argv += ["--target-skin", str(args.target_skin)]
+    if args.firmware_packets_per_chunk != 500:
+        argv += ["--firmware-packets-per-chunk", str(args.firmware_packets_per_chunk)]
+    if args.yes:
+        argv.append("--yes")
+    if args.force:
+        argv.append("--force")
     if args.dry_run:
         argv.append("--dry-run")
     return argv
@@ -161,6 +177,11 @@ def ensure_usb_prompt_args(args: argparse.Namespace, action: str) -> None:
         resolve_host_alias(args)
         if not args.hub_ip:
             args.hub_ip = input("Harmony Hub IP for optional SSH verification (leave blank to skip): ").strip()
+    elif action == "usb-flash-firmware":
+        if not args.firmware_file:
+            args.firmware_file = input("Path to .hfw2 firmware file: ").strip().strip('"')
+    elif action == "usb-factory-reset":
+        return
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,6 +208,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-for-lan", action="store_true")
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
+    parser.add_argument("--firmware-file", default="")
+    parser.add_argument("--target-skin", type=int, default=97)
+    parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
@@ -220,6 +246,14 @@ def main() -> None:
         ensure_usb_prompt_args(args, action)
         print("Running Harmony Hub USB bridge action: root-ssh", flush=True)
         run_subprocess(usb_args(args, "root-ssh"))
+    elif action == "usb-factory-reset":
+        ensure_usb_prompt_args(args, action)
+        print("Running Harmony Hub USB bridge action: factory-reset", flush=True)
+        run_subprocess(usb_args(args, "factory-reset"))
+    elif action == "usb-flash-firmware":
+        ensure_usb_prompt_args(args, action)
+        print("Running Harmony Hub USB bridge action: flash-firmware", flush=True)
+        run_subprocess(usb_args(args, "flash-firmware"))
     else:
         raise SystemExit(f"Unknown action: {action}")
 

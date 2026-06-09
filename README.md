@@ -1,56 +1,39 @@
-# Harmony Hub Tool
+# Harmony Hub Root
 
-For an owned Logitech Harmony Hub. One tool provides the LAN XMPP/HBus root SSH
-flow, XMPP enable flow, USB diagnostics, USB Wi-Fi provisioning, and the
-advanced USB root SSH install path on Windows, Linux, and macOS.
+Tools for an owned Logitech Harmony Hub.
 
-## Files
+The main tool can:
 
-- `Start_Harmony_Hub_Tool.cmd` - double-click Windows launcher
-- `run_harmony_hub_tool.ps1` - unified Windows runner and interactive menu
-- `run_harmony_hub_tool.py` - unified cross-platform runner and interactive menu
-- `run_harmony_hub_tool.sh` - Linux/macOS shell wrapper for the Python runner
-- `harmony_xmpp_root_shell.py` - internal LAN XMPP/HBus engine
-- `harmony_usb_bridge.py` - cross-platform internal USB HID/LTCP bridge engine
-- `harmony_usb_bridge.ps1` - Windows-native internal USB HID/LTCP bridge engine
-- `harmony_usb_hid_probe.ps1` - Windows HID enumerator used by the USB bridge
-- `requirements-usb.txt` - optional hidapi dependency for macOS/Linux USB
-- `rootsshusb.lua` - temporary hub-side USB root SSH installer
-- `dropbearmulti` - MIPS Dropbear binary for Harmony Hub
-- `SHA256SUMS.txt` - integrity hashes
+- enable local XMPP
+- install root SSH over LAN
+- check the hub over USB
+- provision Wi-Fi over USB
+- install root SSH over USB
+- factory reset over USB
+- flash a `.hfw2` firmware bundle over USB
 
-## Requirements
+Only use this on your own hub.
 
-- Python 3.10 or newer
-- Windows 10/11, Linux, or macOS
-- OpenSSH client tools: `ssh` and `ssh-keygen`
-- For LAN root SSH or XMPP enable: Harmony Hub IP address, PC and hub on the same LAN, and the
-  hub completed normal first-time setup in the Harmony phone app.
-- For USB actions: a USB cable connected to the hub.
-- For macOS USB actions: install hidapi with `python3 -m pip install -r requirements-usb.txt`.
-- For Linux USB actions: the tool can use `/dev/hidraw*` directly. If your user
-  cannot open the hub, run once with `sudo` or add a udev rule for `046d:c129`.
-  hidapi is also supported with `python3 -m pip install -r requirements-usb.txt`.
-- For LAN actions, local hub control must be reachable. If XMPP on `5222` is
-  disabled, the tool will try to turn it on through the hub's `8088` WebSocket
-  config path.
+## Quick Start
 
-## Usage
+### Windows
 
-On Windows, double-click:
+Double-click:
 
 ```text
 Start_Harmony_Hub_Tool.cmd
 ```
 
-Or open PowerShell in the repository root:
+Or run it from PowerShell:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\run_harmony_hub_tool.ps1
 ```
 
-On Linux/macOS, run:
+### Linux or macOS
+
+Run:
 
 ```bash
 python3 run_harmony_hub_tool.py
@@ -62,7 +45,7 @@ or:
 sh ./run_harmony_hub_tool.sh
 ```
 
-All paths show one interactive menu:
+You will see this menu:
 
 ```text
 1. LAN root SSH install
@@ -73,53 +56,108 @@ All paths show one interactive menu:
 6. Wi-Fi scan over USB
 7. Provision Wi-Fi over USB
 8. USB root SSH install
+9. Factory reset over USB
+10. Flash firmware over USB (.hfw2)
 ```
 
-You can also call one action directly on Windows:
+## What To Pick
+
+- Choose `1` if the hub is already on your LAN and you want root SSH.
+- Choose `2` if you only want to turn local XMPP back on.
+- Choose `3` first when testing USB. It is read-only.
+- Choose `4` to print hub info over USB.
+- Choose `5` or `6` to check Wi-Fi over USB.
+- Choose `7` to put the hub on Wi-Fi over USB, similar to MyHarmony setup.
+- Choose `8` for the USB root SSH path.
+- Choose `9` to factory reset the hub over USB.
+- Choose `10` to flash a Logitech `.hfw2` firmware bundle over USB.
+
+If you are not sure where to start, use `3. USB preflight` for USB work or
+`2. Enable XMPP over LAN` for LAN work.
+
+## Requirements
+
+- Python 3.10 or newer
+- OpenSSH client tools: `ssh` and `ssh-keygen`
+- A Harmony Hub you own
+- For LAN actions: the hub IP address, with your computer and hub on the same network
+- For USB actions: a USB cable connected to the hub
+
+The hub should already have completed normal first-time setup at least once.
+
+## USB On Linux And macOS
+
+Linux can usually use `/dev/hidraw*` directly. If the tool finds the hub but
+cannot open it, run once with `sudo` or add a udev rule:
+
+```text
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c129", MODE="0660", TAG+="uaccess"
+```
+
+Then reload udev rules and reconnect the hub.
+
+macOS needs the Python hidapi package:
+
+```bash
+python3 -m pip install -r requirements-usb.txt
+```
+
+Linux can also use hidapi if you prefer:
+
+```bash
+python3 -m pip install -r requirements-usb.txt
+```
+
+## Direct Commands
+
+Windows:
 
 ```powershell
 .\run_harmony_hub_tool.ps1 -Action lan-root -HubHost "<hub-ip>"
 .\run_harmony_hub_tool.ps1 -Action enable-xmpp -HubHost "<hub-ip>"
 .\run_harmony_hub_tool.ps1 -Action usb-preflight
-.\run_harmony_hub_tool.ps1 -Action usb-sysinfo
-.\run_harmony_hub_tool.ps1 -Action usb-wifi-status
-.\run_harmony_hub_tool.ps1 -Action usb-wifi-scan -ShowSsids
-.\run_harmony_hub_tool.ps1 -Action usb-provision-wifi -Ssid "<ssid>" -WifiPassword "<password>" -Encryption "WPA2-PSK"
-.\run_harmony_hub_tool.ps1 -Action usb-root-ssh -HubIp "<hub-ip>"
+.\run_harmony_hub_tool.ps1 -Action usb-provision-wifi -Ssid "<ssid>" -WifiPassword "<password>"
+.\run_harmony_hub_tool.ps1 -Action usb-factory-reset
+.\run_harmony_hub_tool.ps1 -Action usb-flash-firmware -FirmwareFile "C:\path\to\firmware.hfw2"
 ```
 
-Direct Linux/macOS examples:
+Linux/macOS:
 
 ```bash
 python3 run_harmony_hub_tool.py --action lan-root --hub-host "<hub-ip>"
 python3 run_harmony_hub_tool.py --action enable-xmpp --hub-host "<hub-ip>"
 python3 run_harmony_hub_tool.py --action usb-preflight
-python3 run_harmony_hub_tool.py --action usb-sysinfo
-python3 run_harmony_hub_tool.py --action usb-wifi-status
-python3 run_harmony_hub_tool.py --action usb-wifi-scan --show-ssids
-python3 run_harmony_hub_tool.py --action usb-provision-wifi --ssid "<ssid>" --wifi-password "<password>" --encryption "WPA2-PSK"
-python3 run_harmony_hub_tool.py --action usb-root-ssh --hub-ip "<hub-ip>"
+python3 run_harmony_hub_tool.py --action usb-provision-wifi --ssid "<ssid>" --wifi-password "<password>"
+python3 run_harmony_hub_tool.py --action usb-factory-reset
+python3 run_harmony_hub_tool.py --action usb-flash-firmware --firmware-file "/path/to/firmware.hfw2"
 ```
 
-Windows can also exercise the cross-platform USB backend through PowerShell:
+Wi-Fi provisioning saves the network by default. Add `-NoSave` on PowerShell or
+`--no-save` with Python for a temporary connection.
 
-```powershell
-.\run_harmony_hub_tool.ps1 -Action usb-preflight -UsbBackend python
-```
+Factory reset and firmware flashing ask for confirmation before writing to the
+hub. For unattended use, add `-Yes` on PowerShell or `--yes` with Python.
 
-USB Wi-Fi provisioning persists by default, matching MyHarmony's
-`savewifinetwork` flow. Add `-NoSave` for a temporary association. Password
-input from the interactive runners is hidden and is not written to disk by the
-runners.
+The flasher reads `Description.xml` inside the `.hfw2`, checks the local MD5,
+and refuses firmware that is not intended for SKIN `97` by default. Use
+`-TargetSkin` or `--target-skin` for another supported model. Use `-Force` or
+`--force` only when you have already checked the bundle yourself.
 
-The LAN root SSH flow creates or reuses an SSH key at:
+## After LAN Root
+
+The LAN root flow creates or reuses this SSH key:
 
 ```text
 %USERPROFILE%\.ssh\harmony_owner_ed25519
 ```
 
-When LAN root SSH completes, the tool prints the detected Harmony Hub ID and
-writes handoff files for the post-root web UI installer:
+On Linux/macOS this is:
+
+```text
+~/.ssh/harmony_owner_ed25519
+```
+
+When it finishes, it writes hub ID handoff files for the web UI installer:
 
 ```text
 %USERPROFILE%\.harmony-hub\hub_id.txt
@@ -127,119 +165,15 @@ writes handoff files for the post-root web UI installer:
 %USERPROFILE%\.harmony-hub\known_hubs.json
 ```
 
-The Hub ID is required by Harmony's local WebSocket/HBus API. Do not substitute
-a guessed value.
-
-For LAN-only scripting you can still call the internal Python engine directly:
-
-```bash
-python3 harmony_xmpp_root_shell.py --host <hub-ip>
-```
-
-If the tool cannot infer the hub ID while XMPP is disabled, pass a known ID with
-`--hub-id <numeric-id>`. To only enable XMPP and skip root SSH, pass
-`--enable-xmpp-only`.
-
-## Tested Firmware
-
-This tool was tested on Logitech Harmony Hub firmware `4.15.600`.
-
-## Why This Exploit Works
-
-This is a LAN-only post-setup exploit chain. It depends on the hub already being
-provisioned through the Harmony phone app because normal setup joins the hub to
-Wi-Fi and exposes Logitech's local HBus control interface. If XMPP is disabled,
-the tool first attempts the same developer-option toggle used by the Harmony
-mobile setup bundle: it writes `enableXMPP = 1` to
-`dynamite://HomeAutomationService/Config/` through `proxy.resource?get` and
-`proxy.resource?put` on the local WebSocket service.
-
-The chain works because several legacy/debug features trust each other too much:
-
-1. The local XMPP service accepts a legacy local-client login.
-
-   The hub exposes XMPP on TCP port `5222` for older Harmony local control
-   clients. After opening an XMPP stream, the tool authenticates with SASL PLAIN
-   as a local client identity. On affected firmware this is accepted by the
-   local service and gives access to the internal HBus command bridge.
-
-2. XMPP forwards commands into privileged HBus handlers.
-
-   XMPP messages contain `<oa>` command stanzas such as `connect.sysinfo?get`,
-   `harmony.log?put`, and `connect.jsonfiletransfer?get`. The hub forwards those
-   into the Harmony application layer. That application layer is not a tiny
-   unprivileged web API; it has access to internal configuration paths and the
-   vendor debug/update plumbing.
-
-3. `harmony.log?put` has a path traversal bug.
-
-   The log-write API accepts a client supplied `fileName` and `data`. It should
-   restrict writes to the intended log/cache directory, but affected firmware
-   does not sufficiently canonicalize or sandbox the filename before writing.
-   Supplying a filename like `../etc/tdeenable` makes the log writer escape its
-   normal directory and create `/etc/tdeenable` with controlled contents.
-
-4. `/etc/tdeenable` is a real vendor debug-mode switch.
-
-   This is not a made-up marker. Harmony firmware checks `/etc/tdeenable`
-   through its own TDE/development-mode logic. In production mode, sensitive APIs
-   such as JSON file transfer are blocked with errors like `594 Cannot access
-   this API in production mode`. Once `/etc/tdeenable` exists and the Harmony app
-   refreshes or restarts, those same APIs become available.
-
-5. TDE mode unlocks file staging.
-
-   With TDE enabled, `connect.jsonfiletransfer?put` can write structured files
-   into locations the Harmony app later reads. The tool uses this to stage a
-   temporary automation package manifest, a Lua loader, a Lua installer, and
-   base64 chunks of the Dropbear SSH payload. Large binary data is split into
-   small chunks because the log/file-write path can silently truncate larger
-   writes.
-
-6. `harmony.automation?discover` loads and executes the staged Lua package.
-
-   The automation discovery path takes a `gatewayType` value and looks for a
-   matching package. By staging a package with a fresh random name, then calling
-   `harmony.automation?discover` with that name, the tool causes the Harmony app
-   to load the staged Lua code. The Lua code runs in the hub-side automation
-   environment, which has enough privilege to write files, chmod them, and run
-   shell commands.
-
-7. The Lua installer turns the temporary write primitive into persistent SSH.
-
-   The installer reconstructs the uploaded files from base64 chunks, verifies
-   hashes, writes the MIPS `dropbearmulti` binary, installs wrapper commands at
-   `/usr/sbin/dropbear` and `/usr/sbin/dropbearkey`, creates
-   `/home/root/.ssh/authorized_keys`, fixes permissions, generates host keys if
-   needed, kills any old Dropbear process, and starts Dropbear on TCP port `22`.
-
-8. SSH persists because the firmware already has a TDE boot hook.
-
-   The installed `/etc/tdeenable` file is also the persistence mechanism. On a
-   real boot, the stock Harmony init path sees TDE enabled and invokes
-   `/usr/sbin/dropbear`. Because the tool replaces that path with a wrapper that
-   launches the installed Dropbear binary, SSH comes back after power cycles
-   without needing to rerun the exploit.
-
-In short: the bug is not just "one command gives root." The chain is:
+On Linux/macOS these live under:
 
 ```text
-local XMPP access
-  -> privileged HBus command bridge
-  -> path traversal in harmony.log?put
-  -> create /etc/tdeenable
-  -> unlock vendor TDE file-transfer/debug APIs
-  -> stage Lua automation package
-  -> trigger package through automation discovery
-  -> install and start persistent Dropbear SSH
+~/.harmony-hub/
 ```
 
-The exploit fails if the hub is not fully set up, if neither XMPP nor the local
-WebSocket config path is reachable, if the PC cannot reach the hub on the LAN,
-or if the firmware has patched either the log-write traversal or the TDE-gated
-automation/file-transfer behavior.
+Do not guess the hub ID. Use the one printed by the tool.
 
-## What It Installs
+## What Root SSH Installs
 
 ```text
 /etc/tdeenable
@@ -249,11 +183,88 @@ automation/file-transfer behavior.
 /home/root/.ssh/authorized_keys
 ```
 
-SSH persists after reboot through the stock `/etc/tdeenable` boot path.
+SSH should survive power cycles through the hub's own TDE boot path.
 
-## Notes
+## Root Vulnerability
 
-If SSH warns that the host key changed, remove the old hub entry from
-`%USERPROFILE%\.ssh\known_hosts` on Windows or `~/.ssh/known_hosts` on
-Linux/macOS and reconnect. This is expected if the hub was previously rooted or
-reset.
+The LAN root path uses old local-control plumbing that Logitech left in the
+Harmony Hub firmware.
+
+The important pieces are:
+
+- The hub can expose a local XMPP service on port `5222`.
+- That XMPP service can pass commands into the hub's internal HBus API.
+- One HBus command, `harmony.log?put`, writes log files using a caller-supplied
+  filename.
+- On affected firmware, that filename is not locked down properly.
+
+Because of that filename bug, a request can escape the normal log directory and
+write `/etc/tdeenable`.
+
+`/etc/tdeenable` matters because it is a real Logitech debug/development-mode
+switch. Once the file exists, APIs that are normally blocked in production mode
+become usable, including the JSON file-transfer path.
+
+The tool then uses those newly available APIs to stage a small Lua package on
+the hub. When `harmony.automation?discover` is called with the package name, the
+hub loads the package and runs the Lua code. The Lua installer writes Dropbear,
+sets permissions, installs your SSH public key, and starts SSH as root.
+
+The short version:
+
+```text
+XMPP/HBus access
+  -> harmony.log?put path traversal
+  -> write /etc/tdeenable
+  -> unlock TDE file-transfer APIs
+  -> stage Lua package
+  -> trigger harmony.automation?discover
+  -> install Dropbear SSH
+```
+
+SSH persists because the stock firmware already checks `/etc/tdeenable` during
+boot and starts `/usr/sbin/dropbear` in that mode. This tool installs a wrapper
+there that launches the bundled Dropbear binary.
+
+If XMPP is off, the tool first tries to turn it on through the local WebSocket
+service on port `8088` by updating the hub's home automation config.
+
+The USB path uses the same hub-side APIs, but reaches them through the hub's USB
+HID interface instead of the LAN XMPP socket. The USB device is `046d:c129`, and
+normal commands are sent as LTCP-framed JSON, matching Logitech's desktop tools.
+Factory reset and firmware flashing use the lower-level LTCP file protocol from
+the MyHarmony USB templates.
+
+## Troubleshooting
+
+If SSH says the host key changed, remove the old hub entry from
+`known_hosts` and reconnect.
+
+If USB does not work:
+
+- run `usb-preflight` first
+- reconnect the hub
+- on Linux, check hidraw permissions or try `sudo`
+- on macOS, install `requirements-usb.txt`
+
+If LAN rooting fails, check that the hub is already set up, the IP address is
+right, and your computer can reach the hub on the same network.
+
+## Files
+
+- `Start_Harmony_Hub_Tool.cmd` - Windows launcher
+- `run_harmony_hub_tool.ps1` - Windows runner
+- `run_harmony_hub_tool.py` - cross-platform runner
+- `run_harmony_hub_tool.sh` - Linux/macOS wrapper
+- `harmony_xmpp_root_shell.py` - LAN XMPP/HBus code
+- `harmony_usb_bridge.py` - cross-platform USB code
+- `harmony_usb_bridge.ps1` - Windows USB code
+- `harmony_usb_hid_probe.ps1` - Windows HID probe
+- `rootsshusb.lua` - hub-side USB SSH installer
+- `dropbearmulti` - MIPS Dropbear binary
+- `requirements-usb.txt` - optional hidapi dependency
+- `SHA256SUMS.txt` - file hashes
+
+## Tested Firmware
+
+Tested on Harmony Hub firmware `4.15.600`.

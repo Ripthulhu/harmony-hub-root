@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-root-ssh")]
+    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-root-ssh", "usb-factory-reset", "usb-flash-firmware")]
     [string]$Action = "",
 
     [string]$HubHost = "",
@@ -24,6 +24,11 @@ param(
     [switch]$WaitForLan,
     [int]$LanPort = 8088,
     [int]$LanWaitSeconds = 90,
+    [string]$FirmwareFile = "",
+    [int]$TargetSkin = 97,
+    [int]$FirmwarePacketsPerChunk = 500,
+    [switch]$Yes,
+    [switch]$Force,
     [ValidateSet("auto", "native", "python", "hidapi", "hidraw")]
     [string]$UsbBackend = "auto",
 
@@ -57,10 +62,12 @@ function Read-ToolAction {
     Write-Host "6. Wi-Fi scan over USB"
     Write-Host "7. Provision Wi-Fi over USB"
     Write-Host "8. USB root SSH install"
+    Write-Host "9. Factory reset over USB"
+    Write-Host "10. Flash firmware over USB (.hfw2)"
     Write-Host ""
 
     while ($true) {
-        $choice = Read-Host "Choose an action [1-8]"
+        $choice = Read-Host "Choose an action [1-10]"
         switch ($choice.Trim()) {
             "1" { return "lan-root" }
             "2" { return "enable-xmpp" }
@@ -70,7 +77,9 @@ function Read-ToolAction {
             "6" { return "usb-wifi-scan" }
             "7" { return "usb-provision-wifi" }
             "8" { return "usb-root-ssh" }
-            default { Write-Host "Enter a number from 1 to 8." }
+            "9" { return "usb-factory-reset" }
+            "10" { return "usb-flash-firmware" }
+            default { Write-Host "Enter a number from 1 to 10." }
         }
     }
 }
@@ -213,14 +222,15 @@ function Add-CommonUsbArgs {
 function Invoke-UsbAction {
     param([string]$UsbAction)
 
-    if ($UsbBackend -in @("python", "hidapi", "hidraw")) {
+    $requiresPythonBackend = $UsbAction -in @("factory-reset", "flash-firmware")
+    if ($UsbBackend -in @("python", "hidapi", "hidraw") -or $requiresPythonBackend) {
         $python = Get-PythonInvocation
         $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
         if (-not (Test-Path -LiteralPath $tool)) {
             throw "Missing Python USB bridge script: $tool"
         }
 
-        $backend = if ($UsbBackend -eq "python") { "auto" } else { $UsbBackend }
+        $backend = if ($UsbBackend -in @("python", "native")) { "auto" } else { $UsbBackend }
         $args = [System.Collections.Generic.List[string]]::new()
         foreach ($arg in $python.Args) {
             $args.Add($arg)
@@ -269,8 +279,33 @@ function Invoke-UsbAction {
             $args.Add("--lan-wait-seconds")
             $args.Add([string]$LanWaitSeconds)
         }
+        if (-not [string]::IsNullOrWhiteSpace($FirmwareFile)) {
+            $args.Add("--firmware-file")
+            $args.Add($FirmwareFile)
+        }
+        if ($TargetSkin -gt 0) {
+            $args.Add("--target-skin")
+            $args.Add([string]$TargetSkin)
+        }
+        if ($FirmwarePacketsPerChunk -ne 500) {
+            $args.Add("--firmware-packets-per-chunk")
+            $args.Add([string]$FirmwarePacketsPerChunk)
+        }
+        if ($Yes) {
+            $args.Add("--yes")
+        }
+        if ($Force) {
+            $args.Add("--force")
+        }
+        if ($DryRun) {
+            $args.Add("--dry-run")
+        }
 
-        Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
+        if ($requiresPythonBackend -and $UsbBackend -eq "native") {
+            Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction (required for raw firmware/reset protocol)"
+        } else {
+            Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
+        }
         & $python.Exe @args
         if ($LASTEXITCODE -ne 0) {
             throw "USB action exited with code $LASTEXITCODE."
@@ -358,6 +393,15 @@ try {
                 $HubIp = Read-Host "Harmony Hub IP for optional SSH verification (leave blank to skip)"
             }
             Invoke-UsbAction -UsbAction "root-ssh"
+        }
+        "usb-factory-reset" {
+            Invoke-UsbAction -UsbAction "factory-reset"
+        }
+        "usb-flash-firmware" {
+            if ([string]::IsNullOrWhiteSpace($FirmwareFile)) {
+                $FirmwareFile = Read-Host "Path to .hfw2 firmware file"
+            }
+            Invoke-UsbAction -UsbAction "flash-firmware"
         }
     }
 } catch {

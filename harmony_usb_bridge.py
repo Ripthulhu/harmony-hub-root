@@ -26,6 +26,8 @@ import stat
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Any
 
 
@@ -46,6 +48,8 @@ ACTION_CHOICES = (
     "wifi-scan",
     "wifi-connect",
     "provision-wifi",
+    "factory-reset",
+    "flash-firmware",
 )
 
 
@@ -109,6 +113,20 @@ class Response:
 
 
 @dataclasses.dataclass
+class RawResponse:
+    device_path: str
+    command_id: int
+    sequence: int
+    matched_response: bool
+    frames_written: int
+    raw_response_length: int
+    raw_response_hex: str
+    packet_hex: str
+    read_reports: list[dict[str, Any]]
+    drain: Any
+
+
+@dataclasses.dataclass
 class StageFile:
     id: str
     source: str
@@ -117,6 +135,27 @@ class StageFile:
     bytes: int
     md5: str
     data: str
+
+
+@dataclasses.dataclass
+class FirmwareImage:
+    name: str
+    remote_path: str
+    operation_type: str
+    data: bytes
+    checksum_type: str
+    checksum_seed: int
+    checksum_offset: int
+    checksum_length: int
+    checksum_expected: str
+    reset: bool
+
+
+@dataclasses.dataclass
+class FirmwareBundle:
+    path: pathlib.Path
+    intended_skins: list[int]
+    images: list[FirmwareImage]
 
 
 class UsbBridgeError(RuntimeError):
@@ -173,8 +212,138 @@ def md5_bytes(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def now_epoch() -> int:
     return int(time.time())
+
+
+def parse_descriptor_int(value: str, default: int = 0) -> int:
+    text = (value or "").strip()
+    if not text:
+        return default
+    if text.lower().startswith("0x"):
+        return int(text, 16)
+    return int(text, 10)
+
+
+def find_zip_member(names: list[str], basename: str) -> str:
+    wanted = basename.lower()
+    matches = [name for name in names if pathlib.PurePosixPath(name).name.lower() == wanted]
+    if not matches:
+        raise UsbBridgeError(f"{basename} not found in firmware bundle")
+    return matches[0]
+
+
+def parse_hfw2_bundle(path_value: str) -> FirmwareBundle:
+    path = resolve_local_path(path_value)
+    if not path.is_file():
+        raise UsbBridgeError(f"firmware file not found: {path}")
+    if path.suffix.lower() != ".hfw2":
+        raise UsbBridgeError(f"firmware file should have .hfw2 extension: {path}")
+
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise UsbBridgeError(f"firmware file is not a readable .hfw2/zip bundle: {path}") from exc
+
+    with archive:
+        names = archive.namelist()
+        descriptor_name = find_zip_member(names, "Description.xml")
+        descriptor = archive.read(descriptor_name)
+        try:
+            root = ET.fromstring(descriptor)
+        except ET.ParseError as exc:
+            raise UsbBridgeError(f"Description.xml is not valid XML in {path}") from exc
+
+        intended_skins: list[int] = []
+        for skin in root.findall("./INTENDED/SKIN"):
+            if skin.text and skin.text.strip():
+                intended_skins.append(parse_descriptor_int(skin.text.strip()))
+
+        files_by_name: dict[str, ET.Element] = {}
+        for file_node in root.findall("./FILES/FILE"):
+            name = (file_node.get("NAME") or "").strip()
+            if name:
+                files_by_name[name] = file_node
+
+        images: list[FirmwareImage] = []
+        order_nodes = list(root.findall("./ORDER/ORDER_ELEMENT"))
+        if not order_nodes:
+            order_nodes = [ET.Element("ORDER_ELEMENT", {"NAME": name, "RESET": "true"}) for name in files_by_name]
+
+        for order_node in order_nodes:
+            image_name = (order_node.get("NAME") or "").strip()
+            if image_name not in files_by_name:
+                raise UsbBridgeError(f"ORDER references missing firmware file {image_name!r}")
+            file_node = files_by_name[image_name]
+            checksum_node = file_node.find("./CHECKSUM")
+            if checksum_node is None:
+                raise UsbBridgeError(f"{image_name} has no CHECKSUM entry")
+
+            member_name = find_zip_member(names, image_name)
+            data = archive.read(member_name)
+            checksum_type = (checksum_node.get("TYPE") or "").strip().upper()
+            checksum_seed = parse_descriptor_int(checksum_node.get("SEED") or "0")
+            checksum_offset = parse_descriptor_int(checksum_node.get("OFFSET") or "0")
+            checksum_length = parse_descriptor_int(checksum_node.get("LENGTH") or str(len(data)))
+            checksum_expected = (checksum_node.get("EXPECTEDVALUE") or "").strip().lower()
+            if checksum_type != "MD5":
+                raise UsbBridgeError(f"{image_name} uses unsupported checksum type {checksum_type!r}; expected MD5")
+            if checksum_seed != 0:
+                raise UsbBridgeError(f"{image_name} uses unsupported checksum seed {checksum_seed}; expected 0")
+            if checksum_offset < 0 or checksum_length < 0 or checksum_offset + checksum_length > len(data):
+                raise UsbBridgeError(f"{image_name} checksum range is outside the payload")
+            actual = md5_bytes(data[checksum_offset : checksum_offset + checksum_length])
+            if checksum_expected and actual.lower() != checksum_expected:
+                raise UsbBridgeError(f"{image_name} checksum mismatch: expected {checksum_expected}, got {actual}")
+
+            images.append(
+                FirmwareImage(
+                    name=image_name,
+                    remote_path=(file_node.get("PATH") or "").strip(),
+                    operation_type=(file_node.get("OPERATIONTYPE") or "").strip(),
+                    data=data,
+                    checksum_type=checksum_type,
+                    checksum_seed=checksum_seed,
+                    checksum_offset=checksum_offset,
+                    checksum_length=checksum_length,
+                    checksum_expected=checksum_expected,
+                    reset=(order_node.get("RESET") or "").strip().lower() == "true",
+                )
+            )
+
+    if not images:
+        raise UsbBridgeError(f"no firmware images found in {path}")
+    return FirmwareBundle(path=path, intended_skins=intended_skins, images=images)
+
+
+def firmware_bundle_summary(bundle: FirmwareBundle) -> dict[str, Any]:
+    return {
+        "path": str(bundle.path),
+        "size": bundle.path.stat().st_size,
+        "sha256": sha256_bytes(bundle.path.read_bytes()),
+        "intendedSkins": bundle.intended_skins,
+        "images": [
+            {
+                "name": image.name,
+                "remotePath": image.remote_path,
+                "operationType": image.operation_type,
+                "bytes": len(image.data),
+                "md5": md5_bytes(image.data),
+                "checksum": {
+                    "type": image.checksum_type,
+                    "offset": image.checksum_offset,
+                    "length": image.checksum_length,
+                    "expected": image.checksum_expected,
+                },
+                "reset": image.reset,
+            }
+            for image in bundle.images
+        ],
+    }
 
 
 def normalize_input_report(report: bytes) -> bytes:
@@ -535,12 +704,97 @@ def new_ltcp_frames(request_json: str) -> list[bytes]:
     return frames
 
 
+def raw_param_byte(value: int) -> bytes:
+    if value < 0 or value > 0xFF:
+        raise UsbBridgeError(f"byte parameter out of range: {value}")
+    return bytes([0x01, value])
+
+
+def raw_param_word(value: int) -> bytes:
+    if value < 0 or value > 0xFFFF:
+        raise UsbBridgeError(f"word parameter out of range: {value}")
+    return bytes([0x02, (value >> 8) & 0xFF, value & 0xFF])
+
+
+def raw_param_dword(value: int) -> bytes:
+    if value < 0 or value > 0xFFFFFFFF:
+        raise UsbBridgeError(f"dword parameter out of range: {value}")
+    return bytes([0x04, (value >> 24) & 0xFF, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
+
+
+def raw_param_string(value: str) -> bytes:
+    try:
+        data = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise UsbBridgeError(f"raw LTCP string parameters must be ASCII: {value!r}") from exc
+    if b"\x00" in data:
+        raise UsbBridgeError("raw LTCP string parameters cannot contain NUL bytes")
+    return b"\x00" + data + b"\x00"
+
+
+def raw_frames_from_stream(stream: bytes) -> list[bytes]:
+    frames: list[bytes] = []
+    for offset in range(0, len(stream), 64):
+        frame = bytearray(64)
+        chunk = stream[offset : offset + 64]
+        frame[: len(chunk)] = chunk
+        frames.append(bytes(frame))
+    return frames
+
+
+def raw_primary_frames(command_id: int, sequence: int, params: list[bytes], param_count: int | None = None) -> list[bytes]:
+    if command_id < 0 or command_id > 0xFF:
+        raise UsbBridgeError(f"command id out of range: {command_id}")
+    if sequence < 0 or sequence > 0x7F:
+        raise UsbBridgeError(f"sequence out of range: {sequence}")
+    declared = len(params) if param_count is None else param_count
+    if declared < 0 or declared > 0x3F:
+        raise UsbBridgeError(f"parameter count out of range: {declared}")
+    stream = bytearray([0xFF, command_id, sequence, declared])
+    for param in params:
+        stream.extend(param)
+    return raw_frames_from_stream(bytes(stream))
+
+
+def raw_data_frames(data: bytes, packet_data_size: int = 62) -> list[bytes]:
+    frames: list[bytes] = []
+    if packet_data_size <= 0 or packet_data_size > 62:
+        raise UsbBridgeError(f"raw data packet size should be 1..62, got {packet_data_size}")
+    for offset in range(0, len(data), packet_data_size):
+        frame = bytearray(64)
+        frame[0] = 0x00
+        frame[1] = 0x00
+        chunk = data[offset : offset + packet_data_size]
+        frame[2 : 2 + len(chunk)] = chunk
+        frames.append(bytes(frame))
+    if not frames:
+        frame = bytearray(64)
+        frame[0] = 0x00
+        frame[1] = 0x00
+        frames.append(bytes(frame))
+    return frames
+
+
+def raw_done_frame() -> bytes:
+    frame = bytearray(64)
+    frame[0] = 0x7E
+    return bytes(frame)
+
+
+def find_raw_response_packet(raw: bytes, command_id: int, sequence: int) -> bytes:
+    for offset in range(0, max(0, len(raw) - 3)):
+        if raw[offset] == 0xFF and raw[offset + 1] == command_id and raw[offset + 2] == sequence:
+            return raw[offset : offset + 64]
+    return b""
+
+
 class HarmonyUsbBridge:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.vendor_id = parse_hex_int(args.vendor_id)
         self.product_id = parse_hex_int(args.product_id)
         self.next_command_id = random.randint(100000, 899999)
+        self.next_raw_sequence = random.randint(1, 0x7E)
         self._device: DeviceInfo | None = None
         self._backend: HidBackend | None = None
 
@@ -615,6 +869,114 @@ class HarmonyUsbBridge:
         request_id = self.next_command_id
         self.next_command_id += 1
         return request_id, compact_json({"id": request_id, "cmd": command_name, "data": command_data, "timeout": command_timeout})
+
+    def new_raw_sequence(self) -> int:
+        sequence = self.next_raw_sequence & 0x7F
+        if sequence == 0:
+            sequence = 1
+        self.next_raw_sequence = (sequence + 1) & 0x7F
+        if self.next_raw_sequence == 0:
+            self.next_raw_sequence = 1
+        return sequence
+
+    def raw_exchange(
+        self,
+        command_id: int,
+        frames: list[bytes],
+        sequence: int,
+        read_timeout_ms: int,
+        expect_response: bool = True,
+    ) -> RawResponse:
+        drain_result = None
+        if not self.args.no_drain:
+            try:
+                drain_result = self.drain()
+            except Exception as exc:
+                drain_result = {"error": str(exc)}
+
+        raw_response = bytearray()
+        read_reports: list[dict[str, Any]] = []
+        packet = b""
+        handle, device = self.open_handle()
+        try:
+            if device.output_report_length != DEFAULT_OUTPUT_REPORT_LENGTH:
+                raise UsbBridgeError(f"Unexpected output report length {device.output_report_length}; expected 65.")
+            for frame in frames:
+                if len(frame) != 64:
+                    raise UsbBridgeError(f"raw HID frame should be 64 bytes, got {len(frame)}")
+                handle.write(b"\x00" + frame)
+
+            if expect_response:
+                deadline = time.monotonic() + read_timeout_ms / 1000.0
+                while time.monotonic() < deadline:
+                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    report = handle.read(device.input_report_length, remaining_ms)
+                    if not report:
+                        break
+                    read_reports.append({"bytesRead": len(report), "hex": hex_string(report)})
+                    raw_response.extend(normalize_input_report(report))
+                    packet = find_raw_response_packet(bytes(raw_response), command_id, sequence)
+                    if packet:
+                        break
+        finally:
+            handle.close()
+
+        if expect_response and not packet:
+            packet = find_raw_response_packet(bytes(raw_response), command_id, sequence)
+        return RawResponse(
+            device_path=device.path,
+            command_id=command_id,
+            sequence=sequence,
+            matched_response=bool(packet) if expect_response else True,
+            frames_written=len(frames),
+            raw_response_length=len(raw_response),
+            raw_response_hex=hex_string(bytes(raw_response)),
+            packet_hex=hex_string(packet),
+            read_reports=read_reports,
+            drain=drain_result,
+        )
+
+    def raw_command(
+        self,
+        command_id: int,
+        params: list[bytes],
+        read_timeout_ms: int,
+        param_count: int | None = None,
+        expect_response: bool = True,
+    ) -> RawResponse:
+        sequence = self.new_raw_sequence()
+        frames = raw_primary_frames(command_id, sequence, params, param_count)
+        return self.raw_exchange(command_id, frames, sequence, read_timeout_ms, expect_response)
+
+    def raw_write_data(
+        self,
+        handle_id: int,
+        data: bytes,
+        read_timeout_ms: int,
+        packets_per_chunk: int = 500,
+        include_done: bool = False,
+        label: str = "file",
+    ) -> list[RawResponse]:
+        if packets_per_chunk <= 0 or packets_per_chunk > 0xFFFF:
+            raise UsbBridgeError(f"packets_per_chunk out of range: {packets_per_chunk}")
+        packet_data_size = 62
+        chunk_size = packet_data_size * packets_per_chunk
+        responses: list[RawResponse] = []
+        total = max(1, math.ceil(len(data) / chunk_size))
+        for index, offset in enumerate(range(0, len(data), chunk_size), start=1):
+            chunk = data[offset : offset + chunk_size]
+            data_packets = raw_data_frames(chunk, packet_data_size)
+            packet_count = len(data_packets) + (1 if include_done else 0)
+            sequence = self.new_raw_sequence()
+            frames = raw_primary_frames(0x03, sequence, [raw_param_byte(handle_id), raw_param_word(packet_count)])
+            frames.extend(data_packets)
+            if include_done:
+                frames.append(raw_done_frame())
+            print(f"Writing {label}: chunk {index}/{total} bytes={len(chunk)} packets={packet_count}", flush=True)
+            response = self.raw_exchange(0x03, frames, sequence, read_timeout_ms, expect_response=True)
+            assert_raw_ok(response, f"write {label} chunk {index}/{total}")
+            responses.append(response)
+        return responses
 
     def invoke(self, command_name: str, command_data: Any = "", read_timeout_ms: int | None = None) -> Response:
         read_timeout_ms = self.args.timeout_ms if read_timeout_ms is None else read_timeout_ms
@@ -714,6 +1076,90 @@ def assert_ok(response: Response, what: str) -> None:
         error = response.decode.error if response and response.decode else "no decode"
         attempt_text = f"{response.attempt}/{response.attempts}" if response else "none"
         raise UsbBridgeError(f"{what} failed with code '{code}' (attempt {attempt_text}, complete={complete}, error={error}): {payload}")
+
+
+def assert_raw_ok(response: RawResponse, what: str) -> None:
+    if not response.matched_response:
+        raise UsbBridgeError(
+            f"{what} did not return the expected raw LTCP response "
+            f"(cmd=0x{response.command_id:02X}, seq=0x{response.sequence:02X}, raw={response.raw_response_hex})"
+        )
+    packet = bytes.fromhex(response.packet_hex) if response.packet_hex else b""
+    if len(packet) >= 3 and packet[2] == 0xFF:
+        raise UsbBridgeError(f"{what} returned raw LTCP error packet: {response.packet_hex}")
+
+
+def raw_file_handle(response: RawResponse, what: str) -> int:
+    assert_raw_ok(response, what)
+    packet = bytes.fromhex(response.packet_hex)
+    if len(packet) <= 5:
+        raise UsbBridgeError(f"{what} response did not contain a file handle: {response.packet_hex}")
+    return packet[5]
+
+
+def raw_open_write_file(bridge: HarmonyUsbBridge, remote_path: str, size: int | None, timeout_ms: int = 40000) -> int:
+    params = [raw_param_string(remote_path), raw_param_string("W")]
+    param_count = 3
+    if size is not None:
+        params.append(raw_param_dword(size))
+    response = bridge.raw_command(0x01, params, timeout_ms, param_count=param_count)
+    handle_id = raw_file_handle(response, f"open {remote_path}")
+    print(f"Opened {remote_path}: handle={handle_id}", flush=True)
+    return handle_id
+
+
+def raw_close_file(bridge: HarmonyUsbBridge, handle_id: int, label: str, timeout_ms: int = 30000) -> RawResponse:
+    response = bridge.raw_command(0x07, [raw_param_byte(handle_id)], timeout_ms)
+    assert_raw_ok(response, f"close {label}")
+    print(f"Closed {label}", flush=True)
+    return response
+
+
+def raw_devctrl_checksum(bridge: HarmonyUsbBridge, handle_id: int, image: FirmwareImage, timeout_ms: int = 30000) -> RawResponse:
+    response = bridge.raw_command(
+        0x06,
+        [
+            raw_param_byte(handle_id),
+            raw_param_byte(0x01),
+            raw_param_string(image.checksum_type),
+            raw_param_word(image.checksum_seed),
+            raw_param_dword(image.checksum_offset),
+            raw_param_dword(image.checksum_length),
+            raw_param_string(image.checksum_expected),
+        ],
+        timeout_ms,
+    )
+    assert_raw_ok(response, f"checksum {image.name}")
+    packet = bytes.fromhex(response.packet_hex)
+    if len(packet) <= 7 or packet[7] != ord("m"):
+        raise UsbBridgeError(f"checksum {image.name} did not return match marker 'm': {response.packet_hex}")
+    print(f"Checksum OK for {image.name}", flush=True)
+    return response
+
+
+def raw_flush_firmware(bridge: HarmonyUsbBridge, handle_id: int, image_name: str, timeout_ms: int = 30000) -> RawResponse:
+    response = bridge.raw_command(0x05, [raw_param_byte(handle_id), raw_param_byte(0x00)], timeout_ms)
+    assert_raw_ok(response, f"commit firmware {image_name}")
+    print(f"Committed firmware {image_name}", flush=True)
+    return response
+
+
+def raw_reset_filesystem(bridge: HarmonyUsbBridge, timeout_ms: int = 30000) -> RawResponse:
+    response = bridge.raw_command(0xFF, [raw_param_byte(0x66)], timeout_ms)
+    assert_raw_ok(response, "reset firmware staging filesystem")
+    packet = bytes.fromhex(response.packet_hex)
+    if len(packet) <= 3 or packet[3] != 0x00:
+        raise UsbBridgeError(f"reset firmware staging filesystem returned unexpected packet: {response.packet_hex}")
+    print("Reset firmware staging filesystem", flush=True)
+    return response
+
+
+def raw_reboot_device(bridge: HarmonyUsbBridge) -> RawResponse:
+    sequence = bridge.new_raw_sequence()
+    frames = raw_primary_frames(0xFF, sequence, [raw_param_byte(0x00)])
+    response = bridge.raw_exchange(0xFF, frames, sequence, 2000, expect_response=False)
+    print("Sent reboot command", flush=True)
+    return response
 
 
 def command_json_get(bridge: HarmonyUsbBridge, path: str, file_name: str) -> Response:
@@ -1142,6 +1588,88 @@ def run_wifi_connect(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None
     wait_hub_lan(args)
 
 
+def require_destructive_confirmation(args: argparse.Namespace, label: str) -> None:
+    if args.dry_run or args.yes:
+        return
+    print("")
+    print(label)
+    print("This changes the hub over USB and can interrupt normal operation.")
+    answer = input("Type YES to continue: ").strip()
+    if answer != "YES":
+        raise UsbBridgeError("cancelled")
+
+
+def run_factory_reset(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
+    if args.dry_run:
+        print(pretty_json({"dryRun": True, "action": "factory-reset", "steps": ["write /sys/factoryreset", "write /sys/reboot"]}))
+        return
+
+    require_destructive_confirmation(args, "Factory reset will erase the hub's local configuration and reboot it.")
+
+    handle_id = raw_open_write_file(bridge, "/sys/factoryreset", None)
+    bridge.raw_write_data(handle_id, b"1", 180000, packets_per_chunk=5, include_done=False, label="/sys/factoryreset")
+    raw_close_file(bridge, handle_id, "/sys/factoryreset")
+
+    handle_id = raw_open_write_file(bridge, "/sys/reboot", None)
+    bridge.raw_write_data(handle_id, b"reboot", 180000, packets_per_chunk=5, include_done=False, label="/sys/reboot")
+    raw_close_file(bridge, handle_id, "/sys/reboot", timeout_ms=180000)
+
+    print(pretty_json({"ok": True, "action": "factory-reset", "reboot": True}))
+
+
+def validate_firmware_target(bundle: FirmwareBundle, args: argparse.Namespace) -> None:
+    if args.target_skin <= 0:
+        return
+    if args.target_skin in bundle.intended_skins:
+        return
+    if args.force:
+        return
+    raise UsbBridgeError(
+        f"firmware bundle is intended for skins {bundle.intended_skins}, "
+        f"but --target-skin is {args.target_skin}. Use --force only if you are certain."
+    )
+
+
+def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
+    if not args.firmware_file.strip():
+        raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
+    bundle = parse_hfw2_bundle(args.firmware_file)
+    validate_firmware_target(bundle, args)
+    summary = firmware_bundle_summary(bundle)
+    if args.dry_run:
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": args.target_skin, "bundle": summary}))
+        return
+
+    for image in bundle.images:
+        if image.operation_type.lower() != "firmwareupgrade":
+            raise UsbBridgeError(f"{image.name} has unsupported operation type {image.operation_type!r}")
+        if not image.remote_path:
+            raise UsbBridgeError(f"{image.name} has no remote PATH in Description.xml")
+
+    require_destructive_confirmation(args, f"Firmware flash will write {bundle.path.name} to the hub and reboot it when requested by the bundle.")
+
+    print(pretty_json({"validatedFirmware": summary, "targetSkin": args.target_skin}))
+    raw_reset_filesystem(bridge)
+    for image in bundle.images:
+        print(f"Flashing {image.name} to {image.remote_path} ({len(image.data)} bytes)", flush=True)
+        handle_id = raw_open_write_file(bridge, image.remote_path, len(image.data))
+        bridge.raw_write_data(
+            handle_id,
+            image.data,
+            30000,
+            packets_per_chunk=args.firmware_packets_per_chunk,
+            include_done=True,
+            label=image.name,
+        )
+        raw_devctrl_checksum(bridge, handle_id, image)
+        raw_flush_firmware(bridge, handle_id, image.name)
+        raw_close_file(bridge, handle_id, image.name)
+
+    if any(image.reset for image in bundle.images):
+        raw_reboot_device(bridge)
+    print(pretty_json({"ok": True, "action": "flash-firmware", "images": [image.name for image in bundle.images], "reboot": any(image.reset for image in bundle.images)}))
+
+
 def install_usb_root_ssh(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     if args.chunk_size < 1024 or args.chunk_size > 12000:
         raise UsbBridgeError("--chunk-size should be between 1024 and 12000 to stay under LTCP limits.")
@@ -1194,6 +1722,17 @@ def install_usb_root_ssh(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> 
 
 
 def dry_run(args: argparse.Namespace) -> None:
+    if args.action == "factory-reset":
+        print(pretty_json({"dryRun": True, "action": "factory-reset", "steps": ["write /sys/factoryreset", "write /sys/reboot"]}))
+        return
+    if args.action == "flash-firmware":
+        if not args.firmware_file.strip():
+            raise UsbBridgeError("--firmware-file is required for --action flash-firmware.")
+        bundle = parse_hfw2_bundle(args.firmware_file)
+        validate_firmware_target(bundle, args)
+        print(pretty_json({"dryRun": True, "action": "flash-firmware", "targetSkin": args.target_skin, "bundle": firmware_bundle_summary(bundle)}))
+        return
+
     sample_data: Any = ""
     command_name = "sys.info"
     timeout_ms = args.timeout_ms
@@ -1229,6 +1768,14 @@ def self_test() -> None:
     assert decoded.payload == request, decoded.payload
     candidates = ltcp_candidates(raw)
     assert candidates and candidates[-1].complete
+    open_frames = raw_primary_frames(0x01, 0x22, [raw_param_string("/fw/otaupdate"), raw_param_string("W"), raw_param_dword(1234)])
+    assert len(open_frames) == 1
+    assert open_frames[0][:4] == bytes([0xFF, 0x01, 0x22, 0x03])
+    write_frames = raw_primary_frames(0x03, 0x23, [raw_param_byte(1), raw_param_word(2)])
+    write_frames.extend(raw_data_frames(b"abc"))
+    write_frames.append(raw_done_frame())
+    assert len(write_frames) == 3
+    assert write_frames[0][:4] == bytes([0xFF, 0x03, 0x23, 0x02])
     print("USB bridge self-test OK")
 
 
@@ -1264,6 +1811,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
     parser.add_argument("--package-root", default=".")
     parser.add_argument("--chunk-size", type=int, default=8000)
+    parser.add_argument("--firmware-file", default="")
+    parser.add_argument("--target-skin", type=int, default=97)
+    parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -1299,6 +1851,10 @@ def main() -> None:
         run_wifi_scan(bridge, args)
     elif args.action in {"wifi-connect", "provision-wifi"}:
         run_wifi_connect(bridge, args)
+    elif args.action == "factory-reset":
+        run_factory_reset(bridge, args)
+    elif args.action == "flash-firmware":
+        run_flash_firmware(bridge, args)
     elif args.action == "root-ssh":
         install_usb_root_ssh(bridge, args)
     else:
