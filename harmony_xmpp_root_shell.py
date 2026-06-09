@@ -1272,9 +1272,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    step("Harmony Hub LAN Root SSH Installer")
+    step("Harmony Hub LAN Tool")
     info("This tool is for an owned Harmony Hub on the same LAN as this computer.")
-    info("It installs persistent root SSH, then optionally opens an interactive root shell.")
+    if args.enable_xmpp_only:
+        info("It enables the local XMPP service without installing root SSH.")
+    else:
+        info("It installs persistent root SSH, then optionally opens an interactive root shell.")
     host = args.host.strip() if args.host else ""
     if not host and not args.dry_run:
         host = input("Harmony Hub IP address: ").strip()

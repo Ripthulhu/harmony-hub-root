@@ -1,163 +1,144 @@
-# Harmony Hub Root Tools
+# Harmony Hub Tool
 
-For an owned Logitech Harmony Hub. The LAN tool gains root access through the
-local XMPP/HBus chain, installs Dropbear, and starts persistent SSH access. The
-USB tool talks to the hub's MyHarmony-style HID/LTCP bridge for read-only
-preflight, Wi-Fi provisioning, and USB root SSH installation.
+For an owned Logitech Harmony Hub. One tool provides the LAN XMPP/HBus root SSH
+flow, XMPP enable flow, USB diagnostics, USB Wi-Fi provisioning, and the
+advanced USB root SSH install path on Windows, Linux, and macOS.
 
 ## Files
 
-- `Start_XMPP_Root_Shell.cmd` - double-click launcher
-- `run_xmpp_root_shell.ps1` - PowerShell wrapper
-- `run_xmpp_root_shell.sh` - Linux/macOS shell wrapper
-- `harmony_xmpp_root_shell.py` - LAN installer
-- `Start_USB_Root_Tool.cmd` - double-click USB launcher with prompts
-- `run_usb_root_ssh.ps1` - USB PowerShell runner
-- `harmony_usb_root_ssh.ps1` - USB installer and Wi-Fi provisioner
-- `harmony_usb_hid_probe.ps1` - Windows HID enumerator used by the USB tool
-- `rootsshusb.lua` - temporary hub-side USB installer
+- `Start_Harmony_Hub_Tool.cmd` - double-click Windows launcher
+- `run_harmony_hub_tool.ps1` - unified Windows runner and interactive menu
+- `run_harmony_hub_tool.py` - unified cross-platform runner and interactive menu
+- `run_harmony_hub_tool.sh` - Linux/macOS shell wrapper for the Python runner
+- `harmony_xmpp_root_shell.py` - internal LAN XMPP/HBus engine
+- `harmony_usb_bridge.py` - cross-platform internal USB HID/LTCP bridge engine
+- `harmony_usb_bridge.ps1` - Windows-native internal USB HID/LTCP bridge engine
+- `harmony_usb_hid_probe.ps1` - Windows HID enumerator used by the USB bridge
+- `requirements-usb.txt` - optional hidapi dependency for macOS/Linux USB
+- `rootsshusb.lua` - temporary hub-side USB root SSH installer
 - `dropbearmulti` - MIPS Dropbear binary for Harmony Hub
 - `SHA256SUMS.txt` - integrity hashes
 
 ## Requirements
 
-- Windows 10/11, Linux, or macOS
 - Python 3.10 or newer
+- Windows 10/11, Linux, or macOS
 - OpenSSH client tools: `ssh` and `ssh-keygen`
-- For LAN rooting: Harmony Hub IP address, PC and hub on the same LAN, and the
+- For LAN root SSH or XMPP enable: Harmony Hub IP address, PC and hub on the same LAN, and the
   hub completed normal first-time setup in the Harmony phone app.
-- For USB actions: Windows PowerShell and a USB cable connected to the hub.
-- For LAN rooting, local hub control must be reachable. If XMPP on `5222` is
+- For USB actions: a USB cable connected to the hub.
+- For macOS USB actions: install hidapi with `python3 -m pip install -r requirements-usb.txt`.
+- For Linux USB actions: the tool can use `/dev/hidraw*` directly. If your user
+  cannot open the hub, run once with `sudo` or add a udev rule for `046d:c129`.
+  hidapi is also supported with `python3 -m pip install -r requirements-usb.txt`.
+- For LAN actions, local hub control must be reachable. If XMPP on `5222` is
   disabled, the tool will try to turn it on through the hub's `8088` WebSocket
   config path.
 
-## LAN Root Over XMPP
+## Usage
 
-Finish setup in the Harmony phone app first. The hub must already be joined to
-Wi-Fi, linked to the app, and reachable on the local network.
-
-### Windows
-
-Double-click:
+On Windows, double-click:
 
 ```text
-Start_XMPP_Root_Shell.cmd
-```
-
-Enter the hub IP address when prompted.
-
-The tool creates or reuses an SSH key at:
-
-```text
-%USERPROFILE%\.ssh\harmony_owner_ed25519
-```
-
-### Linux/macOS
-
-From the repository root:
-
-```bash
-./run_xmpp_root_shell.sh --host <hub-ip>
-```
-
-Or call Python directly:
-
-```bash
-python3 harmony_xmpp_root_shell.py --host <hub-ip>
-```
-
-If the tool cannot infer the hub ID while XMPP is disabled, pass a known ID:
-
-```bash
-python3 harmony_xmpp_root_shell.py --host <hub-ip> --hub-id <numeric-id>
-```
-
-To only enable XMPP and skip the root install:
-
-```bash
-python3 harmony_xmpp_root_shell.py --host <hub-ip> --enable-xmpp-only
-```
-
-The XMPP-enable preflight can be skipped with `--no-enable-xmpp`.
-
-The tool creates or reuses an SSH key at:
-
-```text
-~/.ssh/harmony_owner_ed25519
-```
-
-It installs persistent root SSH and then opens a root shell:
-
-```text
-ssh -i %USERPROFILE%\.ssh\harmony_owner_ed25519 root@<hub-ip>
-ssh -i ~/.ssh/harmony_owner_ed25519 root@<hub-ip>
-```
-
-At the end, the tool prints the detected Harmony Hub ID as:
-
-```text
-hub_id=<numeric-id>
-```
-
-It also writes the same value to handoff files for the post-root web UI
-installer:
-
-```text
-%USERPROFILE%\.harmony-hub\hub_id.txt
-%USERPROFILE%\.harmony-hub\last_root.json
-%USERPROFILE%\.harmony-hub\known_hubs.json
-~/.harmony-hub/hub_id.txt
-~/.harmony-hub/last_root.json
-~/.harmony-hub/known_hubs.json
-```
-
-The Hub ID is required by Harmony's local WebSocket/HBus API. Do not substitute
-a guessed value.
-
-## USB Root And Wi-Fi
-
-The USB path is useful when the hub is physically connected and you want to
-preflight the MyHarmony HID bridge, inspect/provision Wi-Fi, or install root SSH
-without relying on XMPP first.
-
-Double-click on Windows:
-
-```text
-Start_USB_Root_Tool.cmd
+Start_Harmony_Hub_Tool.cmd
 ```
 
 Or open PowerShell in the repository root:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\run_usb_root_ssh.ps1
+.\run_harmony_hub_tool.ps1
 ```
 
-Both paths show an interactive menu:
+On Linux/macOS, run:
+
+```bash
+python3 run_harmony_hub_tool.py
+```
+
+or:
+
+```bash
+sh ./run_harmony_hub_tool.sh
+```
+
+All paths show one interactive menu:
 
 ```text
-1. Install root SSH
-2. USB preflight
-3. USB sysinfo
-4. Wi-Fi status over USB
-5. Wi-Fi scan over USB
-6. Provision Wi-Fi over USB
+1. LAN root SSH install
+2. Enable XMPP over LAN
+3. USB preflight
+4. USB sysinfo
+5. Wi-Fi status over USB
+6. Wi-Fi scan over USB
+7. Provision Wi-Fi over USB
+8. USB root SSH install
 ```
 
-Manual examples:
+You can also call one action directly on Windows:
 
 ```powershell
-.\harmony_usb_root_ssh.ps1 -Action preflight
-.\harmony_usb_root_ssh.ps1 -Action wifi-status
-.\harmony_usb_root_ssh.ps1 -Action wifi-scan -ShowSsids
-.\harmony_usb_root_ssh.ps1 -Action provision-wifi -Ssid "<ssid>" -WifiPassword "<password>" -Encryption "WPA2-PSK"
-.\harmony_usb_root_ssh.ps1 -Action root-ssh -HubIp "<hub-ip>"
+.\run_harmony_hub_tool.ps1 -Action lan-root -HubHost "<hub-ip>"
+.\run_harmony_hub_tool.ps1 -Action enable-xmpp -HubHost "<hub-ip>"
+.\run_harmony_hub_tool.ps1 -Action usb-preflight
+.\run_harmony_hub_tool.ps1 -Action usb-sysinfo
+.\run_harmony_hub_tool.ps1 -Action usb-wifi-status
+.\run_harmony_hub_tool.ps1 -Action usb-wifi-scan -ShowSsids
+.\run_harmony_hub_tool.ps1 -Action usb-provision-wifi -Ssid "<ssid>" -WifiPassword "<password>" -Encryption "WPA2-PSK"
+.\run_harmony_hub_tool.ps1 -Action usb-root-ssh -HubIp "<hub-ip>"
 ```
 
-`provision-wifi` persists by default, matching MyHarmony's `savewifinetwork`
-flow. Add `-NoSave` for a temporary association. Password input from the
-interactive runner is hidden by PowerShell and is not written to disk by the
-runner.
+Direct Linux/macOS examples:
+
+```bash
+python3 run_harmony_hub_tool.py --action lan-root --hub-host "<hub-ip>"
+python3 run_harmony_hub_tool.py --action enable-xmpp --hub-host "<hub-ip>"
+python3 run_harmony_hub_tool.py --action usb-preflight
+python3 run_harmony_hub_tool.py --action usb-sysinfo
+python3 run_harmony_hub_tool.py --action usb-wifi-status
+python3 run_harmony_hub_tool.py --action usb-wifi-scan --show-ssids
+python3 run_harmony_hub_tool.py --action usb-provision-wifi --ssid "<ssid>" --wifi-password "<password>" --encryption "WPA2-PSK"
+python3 run_harmony_hub_tool.py --action usb-root-ssh --hub-ip "<hub-ip>"
+```
+
+Windows can also exercise the cross-platform USB backend through PowerShell:
+
+```powershell
+.\run_harmony_hub_tool.ps1 -Action usb-preflight -UsbBackend python
+```
+
+USB Wi-Fi provisioning persists by default, matching MyHarmony's
+`savewifinetwork` flow. Add `-NoSave` for a temporary association. Password
+input from the interactive runners is hidden and is not written to disk by the
+runners.
+
+The LAN root SSH flow creates or reuses an SSH key at:
+
+```text
+%USERPROFILE%\.ssh\harmony_owner_ed25519
+```
+
+When LAN root SSH completes, the tool prints the detected Harmony Hub ID and
+writes handoff files for the post-root web UI installer:
+
+```text
+%USERPROFILE%\.harmony-hub\hub_id.txt
+%USERPROFILE%\.harmony-hub\last_root.json
+%USERPROFILE%\.harmony-hub\known_hubs.json
+```
+
+The Hub ID is required by Harmony's local WebSocket/HBus API. Do not substitute
+a guessed value.
+
+For LAN-only scripting you can still call the internal Python engine directly:
+
+```bash
+python3 harmony_xmpp_root_shell.py --host <hub-ip>
+```
+
+If the tool cannot infer the hub ID while XMPP is disabled, pass a known ID with
+`--hub-id <numeric-id>`. To only enable XMPP and skip root SSH, pass
+`--enable-xmpp-only`.
 
 ## Tested Firmware
 
