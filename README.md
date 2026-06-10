@@ -1,8 +1,6 @@
 # Harmony Hub Root
 
-Tools for an owned Logitech Harmony Hub.
-
-The main tool can:
+The tool can:
 
 - enable local XMPP when needed
 - install persistent root SSH over LAN
@@ -80,7 +78,7 @@ If you are not sure where to start, use `2. USB connection test / diagnostics` f
 
 The hub should already have completed normal first-time setup at least once. A freshly factory-reset hub can be provisioned over USB, but normal account-backed setup still needs the Harmony app.
 
-## USB On Linux And macOS
+## USB On Linux And macOS (untested)
 
 Windows uses the native `winhid` backend and does not need hidapi.
 
