@@ -250,8 +250,7 @@ If USB does not work:
 
 - run `usb-preflight` first
 - reconnect the hub
-- on Windows, close MyHarmony, Internet Explorer, Edge IE-mode recovery pages,
-  and Logitech plugin services before running USB actions
+- on Windows, close MyHarmony before running USB actions
 - on Linux, check hidraw permissions or try `sudo`
 - on macOS, install `requirements-usb.txt`
 
