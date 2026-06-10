@@ -402,22 +402,96 @@ def parse_json_if_string(value: Any) -> Any:
         return value
 
 
+def _add_unique_numeric_id(out: list[str], value: object) -> None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4,}", text) and text not in out:
+        out.append(text)
+
+
 def extract_numeric_ids(text: str) -> list[str]:
+    """Extract likely Harmony Hub/GlobalRemote IDs from LAN/XMPP/USB-ish text."""
     ids: list[str] = []
+
+    # Preference files often contain cloudAuth as:
+    #   svcs.myharmony.com;<accountId>;<globalRemoteId>;<token>
+    # The 8088 WebSocket hubId is the GlobalRemote/active remote ID, so prefer
+    # field 3 and keep field 2 as a lower-priority fallback candidate.
+    for match in re.finditer(r'"?cloudAuth"?\s*[,=:]\s*"?([^"\n\r]+)', text, re.I):
+        parts = [part.strip().strip('"') for part in match.group(1).split(';')]
+        if len(parts) >= 3:
+            _add_unique_numeric_id(ids, parts[2])
+        if len(parts) >= 2:
+            _add_unique_numeric_id(ids, parts[1])
+
+    key_names = (
+        "activeRemoteId", "activeRemoteID", "active_remote_id",
+        "remoteId", "remoteID", "remote_id",
+        "hubId", "hubID", "hub_id",
+        "globalRemoteId", "globalRemoteID", "GlobalRemoteId", "global_remote_id",
+        "globalRemote", "GlobalRemote",
+    )
+    key_alt = "|".join(re.escape(name) for name in key_names)
     for pattern in [
-        r'"(?:activeRemoteId|remoteId|hubId)"\s*:\s*"?(\d{4,})"?',
-        r'\b(?:activeRemoteId|remoteId|hubId)\s*[=:]\s*"?(\d{4,})"?',
-        r'req:[^:]+:(\d{4,})',
-        r'([0-9]{6,})Harmony\+Hub',
+        rf'"(?:{key_alt})"\s*:\s*"?(\d{{4,}})"?',
+        rf'\b(?:{key_alt})\s*[,=:]\s*"?(\d{{4,}})"?',
+        r'req:[^:\s]+:(\d{4,})',
+        r'(\d{6,})Harmony\+Hub',
     ]:
-        for match in re.finditer(pattern, text):
-            value = match.group(1)
-            if value not in ids:
-                ids.append(value)
+        for match in re.finditer(pattern, text, re.I):
+            _add_unique_numeric_id(ids, match.group(1))
     return ids
 
 
-def load_saved_hub_ids(host: str) -> list[str]:
+def saved_hub_id_files() -> list[pathlib.Path]:
+    return [
+        pathlib.Path.home() / ".harmony-hub" / "hub_id.txt",
+        pathlib.Path.home() / ".harmony-hub" / "last_root.json",
+        pathlib.Path.home() / ".harmony-hub" / "known_hubs.json",
+        SCRIPT_DIR / "harmony_hub_id.json",
+        SCRIPT_DIR / "harmony_hub_id.txt",
+    ]
+
+
+def delete_saved_hub_ids(host: str) -> list[str]:
+    """Delete/scrub cached Hub ID handoff files.
+
+    Factory reset can leave a new/empty provisioning state behind while these
+    files still contain a Hub ID from an older pairing or another hub.  The
+    WebSocket 8088 layer rejects those with HTTP 401 "Wrong hubId".
+    """
+    removed: list[str] = []
+    config_dir = pathlib.Path.home() / ".harmony-hub"
+    for path in [config_dir / "hub_id.txt", config_dir / "last_root.json", SCRIPT_DIR / "harmony_hub_id.txt", SCRIPT_DIR / "harmony_hub_id.json"]:
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as exc:
+            print(f"WARNING: could not remove stale Hub ID file {path}: {exc}")
+    known_path = config_dir / "known_hubs.json"
+    try:
+        if known_path.exists():
+            known = json.loads(known_path.read_text(encoding="utf-8"))
+            if isinstance(known, dict):
+                if host in known:
+                    del known[host]
+                    known_path.write_text(json.dumps(known, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    removed.append(str(known_path) + f"[{host}]")
+                elif not known:
+                    known_path.unlink()
+                    removed.append(str(known_path))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: could not scrub known_hubs.json: {exc}")
+    return removed
+
+
+def load_saved_hub_ids(host: str, include_global: bool = False) -> list[str]:
+    """Load cached Hub IDs, preferring only host-scoped records by default.
+
+    Old versions also loaded global text/json handoff files unconditionally.
+    After factory reset or when moving between hubs, that can feed a stale ID
+    into the 8088 WebSocket preflight and produce HTTP 401 "Wrong hubId".
+    """
     ids: list[str] = []
 
     def add(value: object) -> None:
@@ -427,37 +501,52 @@ def load_saved_hub_ids(host: str) -> list[str]:
         if re.fullmatch(r"\d{4,}", text) and text not in ids:
             ids.append(text)
 
-    candidates = [
-        pathlib.Path.home() / ".harmony-hub" / "known_hubs.json",
-        pathlib.Path.home() / ".harmony-hub" / "last_root.json",
-        SCRIPT_DIR / "harmony_hub_id.json",
-        SCRIPT_DIR / "harmony_hub_id.txt",
-    ]
-    for path in candidates:
+    def json_host_matches(data: object) -> bool:
+        return isinstance(data, dict) and str(data.get("host") or "").strip() == host
+
+    config_dir = pathlib.Path.home() / ".harmony-hub"
+
+    # Host-scoped cache is the safest saved source.  It can still be stale after
+    # factory reset, so --ignore-saved-hub-id remains the best reset path.
+    known_path = config_dir / "known_hubs.json"
+    try:
+        if known_path.exists():
+            known = json.loads(known_path.read_text(encoding="utf-8"))
+            if isinstance(known, dict):
+                host_data = known.get(host)
+                if isinstance(host_data, dict):
+                    add(host_data.get("hub_id"))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    for path in [config_dir / "last_root.json", SCRIPT_DIR / "harmony_hub_id.json"]:
         try:
             if not path.exists():
-                continue
-            if path.suffix == ".txt":
-                add(path.read_text(encoding="utf-8").strip())
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if path.name == "known_hubs.json" and isinstance(data, dict):
-            host_data = data.get(host)
-            if isinstance(host_data, dict):
-                add(host_data.get("hub_id"))
-            continue
-        if isinstance(data, dict):
-            add(data.get("hub_id"))
-    return ids
+        if json_host_matches(data) or include_global:
+            add(data.get("hub_id") if isinstance(data, dict) else None)
 
+    if include_global:
+        for path in [config_dir / "hub_id.txt", SCRIPT_DIR / "harmony_hub_id.txt"]:
+            try:
+                if path.exists():
+                    add(path.read_text(encoding="utf-8").strip())
+            except OSError:
+                pass
+    return ids
 
 def discover_hub_ids_http(host: str, port: int) -> list[str]:
     probes = [
         {"id": 1, "cmd": "setup.account?getProvisionInfo", "timeout": 10000},
         {"id": 2, "cmd": "vnd.logitech.setup/vnd.logitech.account?getProvisionInfo", "timeout": 10000},
         {"id": 3, "cmd": "connect.sysinfo?get", "timeout": 10000},
+        {"id": 4, "cmd": "setup.account?getGlobalRemote", "timeout": 10000},
+        {"id": 5, "cmd": "vnd.logitech.setup/vnd.logitech.account?getGlobalRemote", "timeout": 10000},
+        {"id": 6, "cmd": "setup.device?getDeviceInfo", "timeout": 10000},
+        {"id": 7, "cmd": "vnd.logitech.setup/vnd.logitech.device?getDeviceInfo", "timeout": 10000},
     ]
     ids: list[str] = []
     for body in probes:
@@ -529,13 +618,17 @@ def enable_xmpp_with_websocket(
 
     print("xmpp_port_open_before_enable=false")
     print("xmpp_enable_candidates=" + ",".join(hub_ids))
+    wrong_hub_ids: list[str] = []
     for hub_id in hub_ids:
         print(f"Trying to enable XMPP through WebSocket hub id {hub_id}...")
         try:
             ws = WebSocketTransport(host, hub_id, hbus_port, domain)
             get_resp = ws.call("proxy.resource?get", {"uri": XMPP_AUTOMATION_CONFIG_URI}, 30)
         except Exception as exc:  # noqa: BLE001
-            print(f"proxy.resource?get failed for hub id {hub_id}: {exc}")
+            msg = str(exc)
+            print(f"proxy.resource?get failed for hub id {hub_id}: {msg}")
+            if "Wrong hubId" in msg or "401" in msg:
+                wrong_hub_ids.append(hub_id)
             continue
 
         get_code = response_code(get_resp)
@@ -586,20 +679,52 @@ def enable_xmpp_with_websocket(
             print("xmpp_port_open_after_enable=true")
             return True
         print("XMPP did not open inside the wait window for this hub id.")
+    if wrong_hub_ids:
+        print("wrong_hub_id_candidates=" + ",".join(wrong_hub_ids))
+        print("hint=The hub explicitly rejected these WebSocket IDs. After factory reset, clear or ignore saved Hub ID cache and use a fresh ID from provisioning/cloudAuth.")
     return False
 
 
-def collect_xmpp_enable_hub_ids(host: str, hbus_port: int, cli_hub_ids: list[str] | None) -> list[str]:
+def collect_xmpp_enable_hub_ids(
+    host: str,
+    hbus_port: int,
+    cli_hub_ids: list[str] | None,
+    ignore_saved: bool = False,
+    use_global_saved: bool = False,
+) -> list[str]:
     hub_ids: list[str] = []
+    cli_ids: list[str] = []
     for value in cli_hub_ids or []:
         if value and value not in hub_ids:
             hub_ids.append(value)
-    for value in load_saved_hub_ids(host):
+            cli_ids.append(value)
+
+    # Fresh LAN discovery is preferred over any cache.  A factory-reset hub can
+    # keep the same IP while its saved GlobalRemote/Hub ID is no longer valid.
+    lan_ids = discover_hub_ids_http(host, hbus_port)
+    for value in lan_ids:
         if value not in hub_ids:
             hub_ids.append(value)
-    for value in discover_hub_ids_http(host, hbus_port):
-        if value not in hub_ids:
-            hub_ids.append(value)
+
+    saved_ids: list[str] = []
+    if not ignore_saved:
+        saved_ids = load_saved_hub_ids(host, include_global=use_global_saved)
+        for value in saved_ids:
+            if value not in hub_ids:
+                hub_ids.append(value)
+
+    if hub_ids:
+        print("hub_id_discovery=" + ",".join(hub_ids))
+        if cli_ids:
+            print("hub_id_discovery_cli=" + ",".join(cli_ids))
+        if lan_ids:
+            print("hub_id_discovery_lan=" + ",".join(lan_ids))
+        if saved_ids:
+            label = "hub_id_discovery_saved_global" if use_global_saved else "hub_id_discovery_saved_host_scoped"
+            print(label + "=" + ",".join(saved_ids))
+    elif ignore_saved:
+        print("hub_id_discovery=none")
+        print("hub_id_discovery_saved=ignored")
     return hub_ids
 
 
@@ -634,7 +759,6 @@ def lock_down_private_key(private_key: pathlib.Path) -> None:
 
 
 def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
-    ssh_keygen = require_tool("ssh-keygen")
     try:
         private_exists = private_key.exists()
         public_exists = public_key.exists()
@@ -644,6 +768,8 @@ def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
         info(f"Using existing SSH public key: {public_key}")
         lock_down_private_key(private_key)
         return
+
+    ssh_keygen = require_tool("ssh-keygen")
     if private_exists and not public_exists:
         info(f"Private key exists but public key is missing; deriving {public_key}")
         public_key.write_text(
@@ -1243,6 +1369,9 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Known numeric hub ID for the 8088 XMPP-enable preflight. Can be passed more than once.",
     )
+    parser.add_argument("--ignore-saved-hub-id", action="store_true", help="do not use cached Hub IDs; useful after factory reset or when moving between hubs")
+    parser.add_argument("--use-global-saved-hub-id", action="store_true", help="also load legacy global hub_id.txt handoff files that are not tied to this host")
+    parser.add_argument("--clear-saved-hub-id", action="store_true", help="remove cached Hub ID handoff files before running")
     parser.add_argument("--dropbearmulti", default="dropbearmulti")
     parser.add_argument("--private-key", default=str(default_key_path()))
     parser.add_argument("--pubkey", help="Public key to install. Default: <private-key>.pub")
@@ -1285,6 +1414,9 @@ def main() -> None:
         raise SystemExit("hub IP is required")
     if args.xmpp_enable_wait < 5:
         raise SystemExit("--xmpp-enable-wait must be at least 5 seconds")
+    if args.clear_saved_hub_id:
+        removed = delete_saved_hub_ids(host)
+        print("cleared_saved_hub_id_files=" + (",".join(removed) if removed else "none"))
 
     if args.enable_xmpp_only:
         if args.no_enable_xmpp:
@@ -1299,7 +1431,13 @@ def main() -> None:
             host,
             args.hbus_port,
             args.domain,
-            collect_xmpp_enable_hub_ids(host, args.hbus_port, args.hub_id),
+            collect_xmpp_enable_hub_ids(
+                host,
+                args.hbus_port,
+                args.hub_id,
+                ignore_saved=args.ignore_saved_hub_id,
+                use_global_saved=args.use_global_saved_hub_id,
+            ),
             args.xmpp_port,
             args.xmpp_enable_wait,
         ):
@@ -1351,7 +1489,13 @@ def main() -> None:
             host,
             args.hbus_port,
             args.domain,
-            collect_xmpp_enable_hub_ids(host, args.hbus_port, args.hub_id),
+            collect_xmpp_enable_hub_ids(
+                host,
+                args.hbus_port,
+                args.hub_id,
+                ignore_saved=args.ignore_saved_hub_id,
+                use_global_saved=args.use_global_saved_hub_id,
+            ),
             args.xmpp_port,
             args.xmpp_enable_wait,
         ):

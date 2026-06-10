@@ -5,19 +5,21 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import os
 import pathlib
 import subprocess
 import sys
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+LAN_TOOL_PATH = SCRIPT_DIR / "harmony_xmpp_root_shell.py"
+USB_BRIDGE_PATH = SCRIPT_DIR / "harmony_usb_bridge.py"
 ACTION_CHOICES = (
     "",
     "lan-root",
     "enable-xmpp",
     "usb-preflight",
     "usb-sysinfo",
+    "usb-hub-id",
     "usb-wifi-status",
     "usb-wifi-scan",
     "usb-provision-wifi",
@@ -29,32 +31,30 @@ ACTION_CHOICES = (
 def read_action() -> str:
     print("")
     print("Harmony Hub Tool")
-    print("1. LAN root SSH install")
-    print("2. Enable XMPP over LAN")
-    print("3. USB preflight")
-    print("4. USB sysinfo")
-    print("5. Wi-Fi status over USB")
-    print("6. Wi-Fi scan over USB")
-    print("7. Provision Wi-Fi over USB")
-    print("8. Factory reset over USB")
-    print("9. Flash firmware over USB (.hfw2)")
+    print("1. Give me root! (roots the device over LAN and enables SSH)")
+    print("2. USB connection test / diagnostics")
+    print("3. USB sysinfo")
+    print("4. Wi-Fi status over USB")
+    print("5. Wi-Fi scan over USB")
+    print("6. Change Wi-Fi over USB")
+    print("7. Factory reset over USB (requires Harmony app setup afterwards)")
+    print("8. Flash firmware over USB (.hfw2)")
     print("")
     mapping = {
         "1": "lan-root",
-        "2": "enable-xmpp",
-        "3": "usb-preflight",
-        "4": "usb-sysinfo",
-        "5": "usb-wifi-status",
-        "6": "usb-wifi-scan",
-        "7": "usb-provision-wifi",
-        "8": "usb-factory-reset",
-        "9": "usb-flash-firmware",
+        "2": "usb-preflight",
+        "3": "usb-sysinfo",
+        "4": "usb-wifi-status",
+        "5": "usb-wifi-scan",
+        "6": "usb-provision-wifi",
+        "7": "usb-factory-reset",
+        "8": "usb-flash-firmware",
     }
     while True:
-        choice = input("Choose an action [1-9]: ").strip()
+        choice = input("Choose an action [1-8]: ").strip()
         if choice in mapping:
             return mapping[choice]
-        print("Enter a number from 1 to 9.")
+        print("Enter a number from 1 to 8.")
 
 
 def resolve_host_alias(args: argparse.Namespace) -> None:
@@ -79,7 +79,7 @@ def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
     pubkey = args.pubkey or private_key + ".pub"
     argv = [
         sys.executable,
-        str(SCRIPT_DIR / "harmony_xmpp_root_shell.py"),
+        str(LAN_TOOL_PATH),
         "--dropbearmulti",
         dropbearmulti,
         "--private-key",
@@ -99,6 +99,12 @@ def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
         argv.append("--enable-xmpp-only")
     if args.no_shell:
         argv.append("--no-shell")
+    if args.ignore_saved_hub_id:
+        argv.append("--ignore-saved-hub-id")
+    if args.use_global_saved_hub_id:
+        argv.append("--use-global-saved-hub-id")
+    if args.clear_saved_hub_id:
+        argv.append("--clear-saved-hub-id")
     if args.dry_run:
         argv.append("--dry-run")
     return argv
@@ -108,7 +114,7 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
     resolve_host_alias(args)
     argv = [
         sys.executable,
-        str(SCRIPT_DIR / "harmony_usb_bridge.py"),
+        str(USB_BRIDGE_PATH),
         "--action",
         usb_action,
         "--backend",
@@ -126,6 +132,12 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
         argv.append("--no-save")
     if args.show_ssids:
         argv.append("--show-ssids")
+    if args.hide_ssids:
+        argv.append("--hide-ssids")
+    if args.raw_output:
+        argv.append("--raw-output")
+    if args.save_hub_id:
+        argv.append("--save-hub-id")
     if args.wait_for_lan:
         argv += ["--wait-for-lan", "--lan-port", str(args.lan_port), "--lan-wait-seconds", str(args.lan_wait_seconds)]
     if args.firmware_file:
@@ -173,6 +185,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hub-host", default="")
     parser.add_argument("--hub-ip", default="")
     parser.add_argument("--hub-id", action="append", default=[])
+    parser.add_argument("--ignore-saved-hub-id", action="store_true", help="do not use cached Hub IDs for LAN/XMPP actions")
+    parser.add_argument("--use-global-saved-hub-id", action="store_true", help="allow legacy global hub_id.txt cache entries")
+    parser.add_argument("--clear-saved-hub-id", action="store_true", help="clear cached Hub ID handoff files before LAN/XMPP actions")
     parser.add_argument("--private-key", default="")
     parser.add_argument("--pubkey", default="")
     parser.add_argument("--dropbearmulti", default="")
@@ -186,6 +201,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encryption", default="WPA2-PSK")
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--show-ssids", action="store_true")
+    parser.add_argument("--hide-ssids", action="store_true")
+    parser.add_argument("--raw-output", action="store_true")
+    parser.add_argument("--save-hub-id", action="store_true", help="save a USB-discovered Hub ID for LAN/XMPP actions")
     parser.add_argument("--wait-for-lan", action="store_true")
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
@@ -201,7 +219,7 @@ def main() -> None:
     args = parse_args()
     action = args.action or read_action()
     if action == "lan-root":
-        print("Running Harmony Hub LAN root SSH flow...", flush=True)
+        print("Running Harmony Hub Give me root! LAN flow...", flush=True)
         run_subprocess(lan_args(args, False))
     elif action == "enable-xmpp":
         print("Running Harmony Hub XMPP enable flow...", flush=True)
@@ -212,6 +230,10 @@ def main() -> None:
     elif action == "usb-sysinfo":
         print("Running Harmony Hub USB bridge action: sysinfo", flush=True)
         run_subprocess(usb_args(args, "sysinfo"))
+    elif action == "usb-hub-id":
+        print("Running Harmony Hub USB bridge action: hub-id", flush=True)
+        args.save_hub_id = True
+        run_subprocess(usb_args(args, "hub-id"))
     elif action == "usb-wifi-status":
         print("Running Harmony Hub USB bridge action: wifi-status", flush=True)
         run_subprocess(usb_args(args, "wifi-status"))
@@ -221,11 +243,12 @@ def main() -> None:
         run_subprocess(usb_args(args, "wifi-scan"))
     elif action == "usb-provision-wifi":
         ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: provision-wifi", flush=True)
+        print("Running Harmony Hub USB bridge action: change-wifi", flush=True)
         run_subprocess(usb_args(args, "provision-wifi"))
     elif action == "usb-factory-reset":
         ensure_usb_prompt_args(args, action)
         print("Running Harmony Hub USB bridge action: factory-reset", flush=True)
+        print("After factory reset, set the hub up again with the Harmony app before normal use.", flush=True)
         run_subprocess(usb_args(args, "factory-reset"))
     elif action == "usb-flash-firmware":
         ensure_usb_prompt_args(args, action)

@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-factory-reset", "usb-flash-firmware")]
+    [ValidateSet("", "lan-root", "enable-xmpp", "usb-preflight", "usb-sysinfo", "usb-hub-id", "usb-wifi-status", "usb-wifi-scan", "usb-provision-wifi", "usb-factory-reset", "usb-flash-firmware")]
     [string]$Action = "",
 
     [string]$HubHost = "",
@@ -12,6 +12,9 @@ param(
     [int]$XmppEnableWait = 90,
     [switch]$NoEnableXmpp,
     [switch]$NoShell,
+    [switch]$IgnoreSavedHubId,
+    [switch]$UseGlobalSavedHubId,
+    [switch]$ClearSavedHubId,
     [switch]$DryRun,
 
     [string]$Ssid = "",
@@ -19,79 +22,32 @@ param(
     [string]$Encryption = "WPA2-PSK",
     [switch]$NoSave,
     [switch]$ShowSsids,
+    [switch]$HideSsids,
+    [switch]$RawOutput,
+    [switch]$SaveHubId,
     [switch]$WaitForLan,
     [int]$LanPort = 8088,
     [int]$LanWaitSeconds = 90,
     [string]$FirmwareFile = "",
-    [int]$TargetSkin = 0,
     [int]$FirmwarePacketsPerChunk = 500,
+    [ValidateSet("auto", "hidapi", "hidraw", "winhid")]
+    [string]$UsbBackend = "auto",
     [switch]$Yes,
     [switch]$Force,
-    [ValidateSet("auto", "native", "python", "hidapi", "hidraw", "winhid")]
-    [string]$UsbBackend = "auto",
 
     [switch]$PauseOnExit
 )
 
 $ErrorActionPreference = "Stop"
-Set-ExecutionPolicy -Scope Process Bypass -Force | Out-Null
-
-function Read-PlainSecret {
-    param([string]$Prompt)
-    $secure = Read-Host $Prompt -AsSecureString
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    } finally {
-        if ($bstr -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-}
-
-function Read-ToolAction {
-    Write-Host ""
-    Write-Host "Harmony Hub Tool"
-    Write-Host "1. LAN root SSH install"
-    Write-Host "2. Enable XMPP over LAN"
-    Write-Host "3. USB preflight"
-    Write-Host "4. USB sysinfo"
-    Write-Host "5. Wi-Fi status over USB"
-    Write-Host "6. Wi-Fi scan over USB"
-    Write-Host "7. Provision Wi-Fi over USB"
-    Write-Host "8. Factory reset over USB"
-    Write-Host "9. Flash firmware over USB (.hfw2)"
-    Write-Host ""
-
-    while ($true) {
-        $choice = Read-Host "Choose an action [1-9]"
-        switch ($choice.Trim()) {
-            "1" { return "lan-root" }
-            "2" { return "enable-xmpp" }
-            "3" { return "usb-preflight" }
-            "4" { return "usb-sysinfo" }
-            "5" { return "usb-wifi-status" }
-            "6" { return "usb-wifi-scan" }
-            "7" { return "usb-provision-wifi" }
-            "8" { return "usb-factory-reset" }
-            "9" { return "usb-flash-firmware" }
-            default { Write-Host "Enter a number from 1 to 9." }
-        }
-    }
-}
-
-function Resolve-HostAlias {
-    if ([string]::IsNullOrWhiteSpace($HubHost) -and -not [string]::IsNullOrWhiteSpace($HubIp)) {
-        $script:HubHost = $HubIp
-    }
-    if ([string]::IsNullOrWhiteSpace($HubIp) -and -not [string]::IsNullOrWhiteSpace($HubHost)) {
-        $script:HubIp = $HubHost
-    }
-}
 
 function Get-PythonInvocation {
-    $python = Get-Command py -ErrorAction SilentlyContinue
-    if ($python) {
+    $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython) {
+        return [pscustomobject]@{ Exe = $venvPython; Args = @() }
+    }
+
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
         return [pscustomobject]@{ Exe = "py"; Args = @("-3") }
     }
 
@@ -100,213 +56,67 @@ function Get-PythonInvocation {
         return [pscustomobject]@{ Exe = "python"; Args = @() }
     }
 
-    $bundledPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-    if (Test-Path -LiteralPath $bundledPython) {
-        return [pscustomobject]@{ Exe = $bundledPython; Args = @() }
-    }
-
-    throw "Python was not found. Install Python 3.10+ or run from Codex with its bundled Python runtime."
+    throw "Python 3 was not found. Install Python 3 or create .venv\Scripts\python.exe next to this launcher."
 }
 
-function Invoke-LanAction {
-    param([bool]$EnableXmppOnly)
-
-    if (-not $HubHost -and -not $DryRun) {
-        $script:HubHost = Read-Host "Harmony Hub IP address"
-    }
-
-    if (-not $Dropbearmulti) {
-        $script:Dropbearmulti = Join-Path $PSScriptRoot "dropbearmulti"
-    }
-    if (-not $PrivateKey) {
-        $script:PrivateKey = Join-Path $env:USERPROFILE ".ssh\harmony_owner_ed25519"
-    }
-    if (-not $PubKey) {
-        $script:PubKey = "$PrivateKey.pub"
-    }
-
-    if (-not $EnableXmppOnly -and -not (Test-Path -LiteralPath $Dropbearmulti)) {
-        throw "dropbearmulti not found: $Dropbearmulti"
-    }
-
-    $python = Get-PythonInvocation
-    $script = Join-Path $PSScriptRoot "harmony_xmpp_root_shell.py"
-    $args = $python.Args + @(
-        $script,
-        "--dropbearmulti", $Dropbearmulti,
-        "--private-key", $PrivateKey,
-        "--pubkey", $PubKey
+function Add-Arg {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Name,
+        [string]$Value
     )
-
-    if ($HubHost) {
-        $args += @("--host", $HubHost)
-    }
-    foreach ($id in @($HubId)) {
-        if ($id) {
-            $args += @("--hub-id", $id)
-        }
-    }
-    if ($XmppEnableWait -ne 90) {
-        $args += @("--xmpp-enable-wait", [string]$XmppEnableWait)
-    }
-    if ($NoEnableXmpp) {
-        $args += "--no-enable-xmpp"
-    }
-    if ($EnableXmppOnly) {
-        $args += "--enable-xmpp-only"
-    }
-    if ($NoShell) {
-        $args += "--no-shell"
-    }
-    if ($DryRun) {
-        $args += "--dry-run"
-    }
-
-    if ($EnableXmppOnly) {
-        Write-Host "Running Harmony Hub XMPP enable flow..."
-    } else {
-        Write-Host "Running Harmony Hub LAN root SSH flow..."
-    }
-    & $python.Exe @args
-    if ($LASTEXITCODE -ne 0) {
-        throw "LAN action exited with code $LASTEXITCODE."
-    }
-}
-
-function Invoke-UsbAction {
-    param([string]$UsbAction)
-
-    $python = Get-PythonInvocation
-    $tool = Join-Path $PSScriptRoot "harmony_usb_bridge.py"
-    if (-not (Test-Path -LiteralPath $tool)) {
-        throw "Missing Python USB bridge script: $tool"
-    }
-
-    $backend = if ($UsbBackend -in @("python", "native")) { "auto" } else { $UsbBackend }
-    $args = [System.Collections.Generic.List[string]]::new()
-    foreach ($arg in $python.Args) {
-        $args.Add($arg)
-    }
-    $args.Add($tool)
-    $args.Add("--action")
-    $args.Add($UsbAction)
-    $args.Add("--backend")
-    $args.Add($backend)
-    if (-not [string]::IsNullOrWhiteSpace($HubIp)) {
-        $args.Add("--hub-ip")
-        $args.Add($HubIp)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Ssid)) {
-        $args.Add("--ssid")
-        $args.Add($Ssid)
-    }
-    if (-not [string]::IsNullOrEmpty($WifiPassword)) {
-        $args.Add("--wifi-password")
-        $args.Add($WifiPassword)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Encryption)) {
-        $args.Add("--encryption")
-        $args.Add($Encryption)
-    }
-    if ($NoSave) {
-        $args.Add("--no-save")
-    }
-    if ($ShowSsids) {
-        $args.Add("--show-ssids")
-    }
-    if ($WaitForLan) {
-        $args.Add("--wait-for-lan")
-        $args.Add("--lan-port")
-        $args.Add([string]$LanPort)
-        $args.Add("--lan-wait-seconds")
-        $args.Add([string]$LanWaitSeconds)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($FirmwareFile)) {
-        $args.Add("--firmware-file")
-        $args.Add($FirmwareFile)
-    }
-    if ($FirmwarePacketsPerChunk -ne 500) {
-        $args.Add("--firmware-packets-per-chunk")
-        $args.Add([string]$FirmwarePacketsPerChunk)
-    }
-    if ($Yes) {
-        $args.Add("--yes")
-    }
-    if ($DryRun) {
-        $args.Add("--dry-run")
-    }
-
-    Write-Host "Running Harmony Hub Python USB bridge action: $UsbAction"
-    & $python.Exe @args
-    if ($LASTEXITCODE -ne 0) {
-        throw "USB action exited with code $LASTEXITCODE."
+    if (-not [string]::IsNullOrWhiteSpace($Value)) {
+        $List.Add($Name)
+        $List.Add($Value)
     }
 }
 
 try {
-    Resolve-HostAlias
-    if ([string]::IsNullOrWhiteSpace($Action)) {
-        $Action = Read-ToolAction
+    $tool = Join-Path $PSScriptRoot "run_harmony_hub_tool.py"
+    if (-not (Test-Path -LiteralPath $tool)) {
+        throw "run_harmony_hub_tool.py was not found next to this launcher."
     }
 
-    switch ($Action) {
-        "lan-root" {
-            Resolve-HostAlias
-            Invoke-LanAction -EnableXmppOnly:$false
-        }
-        "enable-xmpp" {
-            Resolve-HostAlias
-            Invoke-LanAction -EnableXmppOnly:$true
-        }
-        "usb-preflight" {
-            Invoke-UsbAction -UsbAction "preflight"
-        }
-        "usb-sysinfo" {
-            Invoke-UsbAction -UsbAction "sysinfo"
-        }
-        "usb-wifi-status" {
-            Invoke-UsbAction -UsbAction "wifi-status"
-        }
-        "usb-wifi-scan" {
-            if (-not $ShowSsids -and -not $DryRun -and -not $Yes) {
-                $answer = Read-Host "Show SSIDs in scan output? [y/N]"
-                if ($answer.Trim().ToLowerInvariant() -in @("y", "yes")) {
-                    $ShowSsids = $true
-                }
-            }
-            Invoke-UsbAction -UsbAction "wifi-scan"
-        }
-        "usb-provision-wifi" {
-            Resolve-HostAlias
-            if ([string]::IsNullOrWhiteSpace($Ssid)) {
-                $Ssid = Read-Host "Wi-Fi SSID"
-            }
-            if ([string]::IsNullOrWhiteSpace($Encryption)) {
-                $Encryption = "WPA2-PSK"
-            }
-            if ($Encryption.ToUpperInvariant() -notin @("NONE", "OPEN") -and [string]::IsNullOrEmpty($WifiPassword)) {
-                $WifiPassword = Read-PlainSecret "Wi-Fi password"
-            }
-            if (-not $WaitForLan -and -not $DryRun -and -not $Yes) {
-                $answer = Read-Host "Wait for LAN reachability after provisioning? [y/N]"
-                if ($answer.Trim().ToLowerInvariant() -in @("y", "yes")) {
-                    $WaitForLan = $true
-                }
-            }
-            if ($WaitForLan -and [string]::IsNullOrWhiteSpace($HubIp)) {
-                $HubIp = Read-Host "Expected hub IP for LAN check"
-            }
-            Invoke-UsbAction -UsbAction "provision-wifi"
-        }
-        "usb-factory-reset" {
-            Invoke-UsbAction -UsbAction "factory-reset"
-        }
-        "usb-flash-firmware" {
-            if ([string]::IsNullOrWhiteSpace($FirmwareFile)) {
-                $FirmwareFile = Read-Host "Path to .hfw2 firmware file"
-            }
-            Invoke-UsbAction -UsbAction "flash-firmware"
-        }
+    $python = Get-PythonInvocation
+    $toolArgs = [System.Collections.Generic.List[string]]::new()
+    foreach ($arg in $python.Args) { $toolArgs.Add($arg) }
+    $toolArgs.Add($tool)
+
+    Add-Arg $toolArgs "--action" $Action
+    Add-Arg $toolArgs "--hub-host" $HubHost
+    Add-Arg $toolArgs "--hub-ip" $HubIp
+    foreach ($id in @($HubId)) { Add-Arg $toolArgs "--hub-id" $id }
+    Add-Arg $toolArgs "--private-key" $PrivateKey
+    Add-Arg $toolArgs "--pubkey" $PubKey
+    Add-Arg $toolArgs "--dropbearmulti" $Dropbearmulti
+    if ($XmppEnableWait -ne 90) { Add-Arg $toolArgs "--xmpp-enable-wait" ([string]$XmppEnableWait) }
+    if ($NoEnableXmpp) { $toolArgs.Add("--no-enable-xmpp") }
+    if ($NoShell) { $toolArgs.Add("--no-shell") }
+    if ($IgnoreSavedHubId) { $toolArgs.Add("--ignore-saved-hub-id") }
+    if ($UseGlobalSavedHubId) { $toolArgs.Add("--use-global-saved-hub-id") }
+    if ($ClearSavedHubId) { $toolArgs.Add("--clear-saved-hub-id") }
+    if ($DryRun) { $toolArgs.Add("--dry-run") }
+
+    Add-Arg $toolArgs "--usb-backend" $UsbBackend
+    Add-Arg $toolArgs "--ssid" $Ssid
+    if (-not [string]::IsNullOrEmpty($WifiPassword)) { Add-Arg $toolArgs "--wifi-password" $WifiPassword }
+    Add-Arg $toolArgs "--encryption" $Encryption
+    if ($NoSave) { $toolArgs.Add("--no-save") }
+    if ($ShowSsids) { $toolArgs.Add("--show-ssids") }
+    if ($HideSsids) { $toolArgs.Add("--hide-ssids") }
+    if ($RawOutput) { $toolArgs.Add("--raw-output") }
+    if ($SaveHubId) { $toolArgs.Add("--save-hub-id") }
+    if ($WaitForLan) { $toolArgs.Add("--wait-for-lan") }
+    if ($LanPort -ne 8088) { Add-Arg $toolArgs "--lan-port" ([string]$LanPort) }
+    if ($LanWaitSeconds -ne 90) { Add-Arg $toolArgs "--lan-wait-seconds" ([string]$LanWaitSeconds) }
+    Add-Arg $toolArgs "--firmware-file" $FirmwareFile
+    if ($FirmwarePacketsPerChunk -ne 500) { Add-Arg $toolArgs "--firmware-packets-per-chunk" ([string]$FirmwarePacketsPerChunk) }
+    if ($Yes) { $toolArgs.Add("--yes") }
+    if ($Force) { $toolArgs.Add("--force") }
+
+    & $python.Exe @toolArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Tool exited with code $LASTEXITCODE."
     }
 } catch {
     Write-Host ""
