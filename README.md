@@ -269,6 +269,7 @@ right, and your computer can reach the hub on the same network.
 - `dropbearmulti` - MIPS Dropbear binary
 - `requirements-usb.txt` - optional hidapi dependency
 - `SHA256SUMS.txt` - file hashes
+- `contrib/` - things to do once you have root: an application watchdog for the hub's single-threaded Lua process, and a script that turns the hub's stored IR codes into ESPHome YAML. See `contrib/README.md`.
 
 ## Tested Firmware
 
