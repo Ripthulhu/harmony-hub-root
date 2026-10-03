@@ -49,14 +49,9 @@ python3 run_harmony_hub_tool.py
 ```
 
 `sh run_harmony_hub_tool.sh` is an optional launcher that also checks for a local
-`.venv`. The Windows `.cmd` and `.ps1` files are launchers, too; they contain no
-installer logic. All launchers accept the same `--action`, `--hub-host`, and
-other Python options. Old PowerShell options such as `-Action` and `-HubHost`
-have been removed. For example:
-
-```powershell
-.\run_harmony_hub_tool.ps1 --action lan-root --hub-host "<hub-ip>"
-```
+`.venv`. On Windows, `Start_Harmony_Hub_Tool.cmd` provides the same convenience.
+Both launchers accept the Python CLI options, including `--action` and
+`--hub-host`.
 
 ## LAN root and SSH
 
@@ -288,6 +283,6 @@ offline test does not establish USB hardware compatibility. This code review
 did not root, reset, or flash a live hub.
 
 The transport implementations are in `harmony_xmpp_root_shell.py` and
-`harmony_usb_bridge.py`. `harmony_usb_hid_probe.ps1` is a legacy Windows
-diagnostic, not a required installer component. `SHA256SUMS.txt` records the
-distributed files; it is an integrity list, not a signed release.
+`harmony_usb_bridge.py`. The USB bridge's `--action probe` lists attached
+devices. `SHA256SUMS.txt` records the distributed files; it is an integrity
+list, not a signed release.

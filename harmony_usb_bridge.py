@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import csv
 import ctypes
 import dataclasses
 import errno
@@ -24,7 +23,6 @@ import random
 import re
 import select
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -55,13 +53,6 @@ RAW_DEVICE_INFO_PATH = "/rf/deviceinfo"
 RAW_WIFI_STATUS_PATH = "/sys/wifi/connect"
 RAW_WIFI_NETWORKS_PATH = "/sys/wifi/networks"
 RAW_WIFI_CONNECT_PATH = "/sys/wifi/connect"
-WINDOWS_USB_OWNER_PROCESS_NAMES = {
-    "iexplore.exe",
-    "logipluginservice.exe",
-    "logipluginserviceext.exe",
-    "myharmony.exe",
-    "silverlight.configuration.exe",
-}
 ACTION_CHOICES = (
     "probe",
     "drain",
@@ -91,50 +82,6 @@ class DeviceInfo:
     serial: str = ""
     usage_page: int | None = None
     usage: int | None = None
-
-
-@dataclasses.dataclass
-class DecodeResult:
-    complete: bool = False
-    error: str | None = None
-    leading_discarded: int = 0
-    service: int | None = None
-    type: int | None = None
-    request_id: int | None = None
-    is_response: bool = False
-    packet_count: int | None = None
-    payload_length: int = 0
-    payload: str = ""
-
-
-@dataclasses.dataclass
-class Candidate:
-    offset: int
-    complete: bool
-    error: str | None
-    payload_id: str | None
-    code: str | None
-    decode: DecodeResult
-    payload_object: Any
-
-
-@dataclasses.dataclass
-class Response:
-    device_path: str
-    command: str
-    app_request_id: int
-    attempt: int
-    attempts: int
-    matched_response: bool
-    drain: Any
-    request_json: str
-    frames_written: int
-    raw_response_length: int
-    raw_response_hex: str
-    read_reports: list[dict[str, Any]]
-    decode: DecodeResult
-    payload_object: Any
-    candidate_decodes: list[dict[str, Any]]
 
 
 @dataclasses.dataclass
@@ -216,10 +163,6 @@ def parse_hex_int(value: str | int) -> int:
 
 def resolve_local_path(value: str) -> pathlib.Path:
     return pathlib.Path(value).expanduser()
-
-
-def compact_json(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
 def pretty_json(obj: Any) -> str:
@@ -1037,178 +980,6 @@ def make_backends(name: str) -> list[HidBackend]:
     return backends
 
 
-def read_number(data: bytes, offset: int, length: int) -> int:
-    value = 0
-    for i in range(length):
-        value = (value << 8) | data[offset + i]
-    return value
-
-
-def decode_ltcp(data: bytes) -> DecodeResult:
-    result = DecodeResult()
-    start = data.find(b"\xff")
-    if start < 0:
-        result.error = "Need more data for LTCP primary header."
-        return result
-    if start:
-        result.leading_discarded = start
-        data = data[start:]
-    if len(data) < 4:
-        result.error = "Need more data for LTCP primary header."
-        return result
-    if data[0] != 0xFF:
-        result.error = f"Invalid LTCP service byte 0x{data[0]:02X}."
-        return result
-
-    pos = 0
-    result.service = data[pos]
-    pos += 1
-    result.type = data[pos]
-    pos += 1
-    result.request_id = data[pos]
-    result.is_response = bool(result.request_id & 0x80)
-    pos += 1
-    param_count = data[pos] & 0x3F
-    pos += 1
-    packets = 0
-
-    for _ in range(param_count):
-        if pos >= len(data):
-            result.error = "Need more data for LTCP parameter."
-            return result
-        tag = data[pos]
-        pos += 1
-        length = tag & 0x3F
-        if length == 0:
-            while pos < len(data) and data[pos] != 0:
-                pos += 1
-            if pos >= len(data):
-                result.error = "Need more data for LTCP string parameter."
-                return result
-            pos += 1
-        else:
-            if pos + length > len(data):
-                result.error = "Need more data for LTCP numeric parameter."
-                return result
-            packets = read_number(data, pos, length)
-            pos += length
-    result.packet_count = packets
-
-    remaining = packets - 1
-    payload = bytearray()
-    while remaining > 0:
-        while pos < len(data) and data[pos] == 0:
-            pos += 1
-        if pos + 2 > len(data):
-            result.error = "Need more data for LTCP secondary header."
-            return result
-        pos += 1
-        length_byte = data[pos]
-        pos += 1
-        if length_byte & 0x40:
-            if pos >= len(data):
-                result.error = "Need more data for LTCP long secondary length."
-                return result
-            chunk_len = ((length_byte & 0x3F) << 8) | data[pos]
-            pos += 1
-        else:
-            chunk_len = length_byte & 0x3F
-        if pos + chunk_len > len(data):
-            result.error = "Need more data for LTCP secondary payload."
-            return result
-        payload.extend(data[pos : pos + chunk_len])
-        pos += chunk_len
-        remaining -= 1
-
-    result.complete = True
-    result.error = None
-    result.payload_length = len(payload)
-    result.payload = payload.decode("utf-8", "replace")
-    return result
-
-
-def convert_json_payload(payload: str) -> Any:
-    if not payload.strip():
-        return None
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-
-
-def ltcp_candidates(data: bytes) -> list[Candidate]:
-    candidates: list[Candidate] = []
-    for offset, value in enumerate(data):
-        if value != 0xFF:
-            continue
-        decode = decode_ltcp(data[offset:])
-        payload_object = convert_json_payload(decode.payload)
-        payload_id = None
-        code = None
-        if isinstance(payload_object, dict):
-            if "id" in payload_object:
-                payload_id = str(payload_object["id"])
-            if "code" in payload_object:
-                code = str(payload_object["code"])
-        candidates.append(
-            Candidate(
-                offset=offset,
-                complete=decode.complete,
-                error=decode.error,
-                payload_id=payload_id,
-                code=code,
-                decode=decode,
-                payload_object=payload_object,
-            )
-        )
-    return candidates
-
-
-def select_ltcp_candidate(candidates: list[Candidate], expected_id: int, allow_loose: bool) -> Candidate | None:
-    if not candidates:
-        return None
-    expected = str(expected_id)
-    matching_complete = [c for c in candidates if c.complete and c.payload_id == expected]
-    if matching_complete:
-        return matching_complete[-1]
-    if allow_loose:
-        complete = [c for c in candidates if c.complete]
-        if complete:
-            return complete[-1]
-    matching_any = [c for c in candidates if c.payload_id == expected]
-    if matching_any:
-        return matching_any[-1]
-    return candidates[-1]
-
-
-def candidate_matches(candidate: Candidate | None, expected_id: int, allow_loose: bool) -> bool:
-    if not candidate or not candidate.complete:
-        return False
-    if candidate.payload_id == str(expected_id):
-        return True
-    return allow_loose
-
-
-def new_ltcp_frames(request_json: str) -> list[bytes]:
-    payload = request_json.encode("ascii")
-    if len(payload) > 16383:
-        raise UsbBridgeError(f"Payload is too large for one LTCP secondary packet ({len(payload)} bytes).")
-    stream = bytearray([0xFF, 0x08, 0x00, 0x01, 0x01, 0x02, 0x01])
-    if len(payload) > 63:
-        stream.append(0x80 | 0x40 | ((len(payload) >> 8) & 0x3F))
-        stream.append(len(payload) & 0xFF)
-    else:
-        stream.append(0x80 | len(payload))
-    stream.extend(payload)
-    frames: list[bytes] = []
-    for offset in range(0, len(stream), 64):
-        frame = bytearray(64)
-        chunk = stream[offset : offset + 64]
-        frame[: len(chunk)] = chunk
-        frames.append(bytes(frame))
-    return frames
-
-
 def raw_param_byte(value: int) -> bytes:
     if value < 0 or value > 0xFF:
         raise UsbBridgeError(f"byte parameter out of range: {value}")
@@ -1583,18 +1354,11 @@ def assert_raw_write_ok(
     return value
 
 
-# Backwards-compatible alias for older call sites/comments.
-def raw_write_status_summary(response: RawResponse) -> dict[str, Any]:
-    return raw_write_ack_summary(response)
-
-
-
 class HarmonyUsbBridge:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.vendor_id = parse_hex_int(args.vendor_id)
         self.product_id = parse_hex_int(args.product_id)
-        self.next_command_id = random.randint(100000, 899999)
         self.next_raw_sequence = random.randint(1, 0x7E)
         self._device: DeviceInfo | None = None
         self._backend: HidBackend | None = None
@@ -1665,11 +1429,6 @@ class HarmonyUsbBridge:
         finally:
             handle.close()
         return {"reports": len(samples), "samples": samples[:4]}
-
-    def new_command_json(self, command_name: str, command_data: Any, command_timeout: int = 5) -> tuple[int, str]:
-        request_id = self.next_command_id
-        self.next_command_id += 1
-        return request_id, compact_json({"id": request_id, "cmd": command_name, "data": command_data, "timeout": command_timeout})
 
     def new_raw_sequence(self) -> int:
         sequence = self.next_raw_sequence & 0x7F
@@ -1804,27 +1563,6 @@ class HarmonyUsbBridge:
                 break
         return bytes(raw_response), read_reports
 
-    def raw_exchange(
-        self,
-        command_id: int,
-        frames: list[bytes],
-        sequence: int,
-        read_timeout_ms: int,
-        expect_response: bool = True,
-    ) -> RawResponse:
-        drain_result = None
-        if not self.args.no_drain:
-            try:
-                drain_result = self.drain()
-            except Exception as exc:
-                drain_result = {"error": str(exc)}
-
-        handle, device = self.open_handle()
-        try:
-            return self.raw_exchange_on_handle(handle, device, command_id, frames, sequence, read_timeout_ms, expect_response, drain_result)
-        finally:
-            handle.close()
-
     def raw_exchange_on_handle(
         self,
         handle: HidHandle,
@@ -1867,18 +1605,6 @@ class HarmonyUsbBridge:
             drain=drain_result,
         )
 
-    def raw_command(
-        self,
-        command_id: int,
-        params: list[bytes],
-        read_timeout_ms: int,
-        param_count: int | None = None,
-        expect_response: bool = True,
-    ) -> RawResponse:
-        sequence = self.new_raw_sequence()
-        frames = raw_primary_frames(command_id, sequence, params, param_count)
-        return self.raw_exchange(command_id, frames, sequence, read_timeout_ms, expect_response)
-
     def raw_command_on_handle(
         self,
         handle: HidHandle,
@@ -1893,28 +1619,6 @@ class HarmonyUsbBridge:
         sequence = self.new_raw_sequence()
         frames = raw_primary_frames(command_id, sequence, params, param_count)
         return self.raw_exchange_on_handle(handle, device, command_id, frames, sequence, read_timeout_ms, expect_response, None, stop_when)
-
-    def raw_write_data(
-        self,
-        handle_id: int,
-        data: bytes,
-        read_timeout_ms: int,
-        packets_per_chunk: int = 500,
-        include_done: bool = False,
-        label: str = "file",
-        packet_count_width: str = "word",
-        inter_frame_delay_ms: int = 0,
-        chunk_delay_ms: int = 0,
-        data_length_mode: str = DEFAULT_FIRMWARE_DATA_LENGTH_MODE,
-        allowed_write_statuses: set[int] | None = None,
-        fixed_sequence: int | None = None,
-        allow_error_ack: bool = False,
-    ) -> list[RawResponse]:
-        handle, device = self.open_handle()
-        try:
-            return self.raw_write_data_on_handle(handle, device, handle_id, data, read_timeout_ms, packets_per_chunk, include_done, label, packet_count_width, inter_frame_delay_ms, chunk_delay_ms, data_length_mode, allowed_write_statuses, fixed_sequence, allow_error_ack)
-        finally:
-            handle.close()
 
     def raw_write_data_on_handle(
         self,
@@ -2048,99 +1752,6 @@ class HarmonyUsbBridge:
             if chunk_delay_ms > 0 and index < total:
                 time.sleep(chunk_delay_ms / 1000.0)
         return responses
-
-    def invoke(self, command_name: str, command_data: Any = "", read_timeout_ms: int | None = None) -> Response:
-        read_timeout_ms = self.args.timeout_ms if read_timeout_ms is None else read_timeout_ms
-        attempts = max(1, self.args.retry_count + 1)
-        last_response: Response | None = None
-
-        for attempt in range(1, attempts + 1):
-            drain_result = None
-            if not self.args.no_drain:
-                try:
-                    drain_result = self.drain()
-                except Exception as exc:
-                    drain_result = {"error": str(exc)}
-
-            request_id, request_json = self.new_command_json(command_name, command_data)
-            frames = new_ltcp_frames(request_json)
-            selected: Candidate | None = None
-            candidates: list[Candidate] = []
-            handle, device = self.open_handle()
-            try:
-                raw_response, read_reports = self.exchange_reports(
-                    handle,
-                    device,
-                    frames,
-                    read_timeout_ms,
-                    True,
-                    lambda raw: candidate_matches(
-                        select_ltcp_candidate(ltcp_candidates(raw), request_id, self.args.loose_response_match),
-                        request_id,
-                        self.args.loose_response_match,
-                    ),
-                )
-            finally:
-                handle.close()
-
-            if not selected:
-                candidates = ltcp_candidates(raw_response)
-                selected = select_ltcp_candidate(candidates, request_id, self.args.loose_response_match)
-
-            decode = selected.decode if selected else decode_ltcp(raw_response)
-            payload_object = selected.payload_object if selected else convert_json_payload(decode.payload)
-            matched = candidate_matches(selected, request_id, self.args.loose_response_match)
-            last_response = Response(
-                device_path=device.path,
-                command=command_name,
-                app_request_id=request_id,
-                attempt=attempt,
-                attempts=attempts,
-                matched_response=matched,
-                drain=drain_result,
-                request_json=request_json,
-                frames_written=len(frames),
-                raw_response_length=len(raw_response),
-                raw_response_hex=hex_string(raw_response),
-                read_reports=read_reports,
-                decode=decode,
-                payload_object=payload_object,
-                candidate_decodes=[
-                    {
-                        "offset": c.offset,
-                        "complete": c.complete,
-                        "error": c.error,
-                        "payloadId": c.payload_id,
-                        "code": c.code,
-                        "payloadLength": c.decode.payload_length,
-                    }
-                    for c in candidates
-                ],
-            )
-            if matched:
-                return last_response
-            if attempt < attempts and self.args.retry_delay_ms > 0:
-                time.sleep(self.args.retry_delay_ms / 1000.0)
-
-        assert last_response is not None
-        return last_response
-
-
-def response_code(response: Response) -> str:
-    if isinstance(response.payload_object, dict) and "code" in response.payload_object:
-        return str(response.payload_object["code"])
-    return ""
-
-
-def assert_ok(response: Response, what: str) -> None:
-    code = response_code(response)
-    if code != "200":
-        payload = response.decode.payload if response and response.decode else ""
-        complete = response.decode.complete if response and response.decode else False
-        error = response.decode.error if response and response.decode else "no decode"
-        attempt_text = f"{response.attempt}/{response.attempts}" if response else "none"
-        raise UsbBridgeError(f"{what} failed with code '{code}' (attempt {attempt_text}, complete={complete}, error={error}): {payload}")
-
 
 def assert_raw_ok(response: RawResponse, what: str) -> None:
     if not response.matched_response:
@@ -2297,14 +1908,6 @@ def raw_open_write_file_on_handle(
     return handle_id
 
 
-def raw_open_write_file(bridge: HarmonyUsbBridge, remote_path: str, size: int | None, timeout_ms: int = 40000) -> int:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_open_write_file_on_handle(bridge, handle, device, remote_path, size, timeout_ms)
-    finally:
-        handle.close()
-
-
 def raw_close_file_on_handle(
     bridge: HarmonyUsbBridge,
     handle: HidHandle,
@@ -2327,14 +1930,6 @@ def raw_close_file_on_handle(
     assert_raw_ok(response, f"close {label}")
     print(f"Closed {label}", flush=True)
     return response
-
-
-def raw_close_file(bridge: HarmonyUsbBridge, handle_id: int, label: str, timeout_ms: int = 30000) -> RawResponse:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_close_file_on_handle(bridge, handle, device, handle_id, label, timeout_ms)
-    finally:
-        handle.close()
 
 
 def raw_read_file_on_handle(
@@ -2401,37 +1996,25 @@ def raw_read_file(bridge: HarmonyUsbBridge, remote_path: str, packets_per_read: 
         handle.close()
 
 
-def unique_ordered_strings(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
-
-
-def checksum_expected_case_variants(expected: str, mode: str) -> list[tuple[str, str]]:
+def checksum_case_variants(value: str, mode: str, label: str) -> list[tuple[str, str]]:
     if mode == "descriptor":
-        return [("descriptor", expected)]
+        return [("descriptor", value)]
     if mode == "lower":
-        return [("lower", expected.lower())]
+        return [("lower", value.lower())]
     if mode == "upper":
-        return [("upper", expected.upper())]
+        return [("upper", value.upper())]
     if mode != "auto":
-        raise UsbBridgeError(f"unknown checksum case mode: {mode!r}")
-    values = unique_ordered_strings([expected, expected.upper(), expected.lower()])
+        raise UsbBridgeError(f"unknown checksum {label} mode: {mode!r}")
     labels: list[tuple[str, str]] = []
-    for value in values:
-        if value == expected:
-            labels.append(("descriptor", value))
-        elif value == expected.upper():
-            labels.append(("upper", value))
-        elif value == expected.lower():
-            labels.append(("lower", value))
+    for variant in dict.fromkeys([value, value.upper(), value.lower()]):
+        if variant == value:
+            labels.append(("descriptor", variant))
+        elif variant == value.upper():
+            labels.append(("upper", variant))
+        elif variant == value.lower():
+            labels.append(("lower", variant))
         else:
-            labels.append(("variant", value))
+            labels.append(("variant", variant))
     return labels
 
 
@@ -2441,29 +2024,6 @@ def checksum_endian_variants(mode: str) -> list[str]:
     if mode == "auto":
         return ["big", "little"]
     raise UsbBridgeError(f"unknown checksum endian mode: {mode!r}")
-
-
-def checksum_type_variants(checksum_type: str, mode: str) -> list[tuple[str, str]]:
-    if mode == "descriptor":
-        return [("descriptor", checksum_type)]
-    if mode == "lower":
-        return [("lower", checksum_type.lower())]
-    if mode == "upper":
-        return [("upper", checksum_type.upper())]
-    if mode != "auto":
-        raise UsbBridgeError(f"unknown checksum type mode: {mode!r}")
-    values = unique_ordered_strings([checksum_type, checksum_type.upper(), checksum_type.lower()])
-    labels: list[tuple[str, str]] = []
-    for value in values:
-        if value == checksum_type:
-            labels.append(("descriptor", value))
-        elif value == checksum_type.upper():
-            labels.append(("upper", value))
-        elif value == checksum_type.lower():
-            labels.append(("lower", value))
-        else:
-            labels.append(("variant", value))
-    return labels
 
 
 def checksum_numeric_params(image: FirmwareImage, endian: str) -> tuple[bytes, bytes, bytes]:
@@ -2551,8 +2111,8 @@ def raw_devctrl_checksum_on_handle(
     endian_mode = getattr(bridge.args, "firmware_checksum_endian", "auto")
     retries = max(1, int(getattr(bridge.args, "firmware_checksum_retries", DEFAULT_FIRMWARE_CHECKSUM_RETRIES)))
     retry_delay_ms = max(0, int(getattr(bridge.args, "firmware_checksum_retry_delay_ms", DEFAULT_FIRMWARE_CHECKSUM_RETRY_DELAY_MS)))
-    case_variants = checksum_expected_case_variants(image.checksum_expected, case_mode)
-    type_variants = checksum_type_variants(image.checksum_type, type_mode)
+    case_variants = checksum_case_variants(image.checksum_expected, case_mode, "case")
+    type_variants = checksum_case_variants(image.checksum_type, type_mode, "type")
     endian_variants = checksum_endian_variants(endian_mode)
 
     # Keep auto as a diagnostic sweep.  The default v18 path is big-endian
@@ -2636,14 +2196,6 @@ def raw_devctrl_checksum_on_handle(
         failures=failures,
     )
 
-def raw_devctrl_checksum(bridge: HarmonyUsbBridge, handle_id: int, image: FirmwareImage, timeout_ms: int = 30000) -> FirmwareChecksumOutcome:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_devctrl_checksum_on_handle(bridge, handle, device, handle_id, image, timeout_ms)
-    finally:
-        handle.close()
-
-
 def raw_flush_firmware_on_handle(
     bridge: HarmonyUsbBridge,
     handle: HidHandle,
@@ -2665,14 +2217,6 @@ def raw_flush_firmware_on_handle(
     assert_raw_ok(response, f"commit firmware {image_name}")
     print(f"Committed firmware {image_name}", flush=True)
     return response
-
-
-def raw_flush_firmware(bridge: HarmonyUsbBridge, handle_id: int, image_name: str, timeout_ms: int = 30000) -> RawResponse:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_flush_firmware_on_handle(bridge, handle, device, handle_id, image_name, timeout_ms)
-    finally:
-        handle.close()
 
 
 def raw_reset_filesystem_on_handle(
@@ -2714,28 +2258,12 @@ def raw_reset_filesystem_on_handle(
     return response
 
 
-def raw_reset_filesystem(bridge: HarmonyUsbBridge, timeout_ms: int = 30000) -> RawResponse:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_reset_filesystem_on_handle(bridge, handle, device, timeout_ms)
-    finally:
-        handle.close()
-
-
 def raw_reboot_device_on_handle(bridge: HarmonyUsbBridge, handle: HidHandle, device: DeviceInfo) -> RawResponse:
     sequence = bridge.new_raw_sequence()
     frames = raw_primary_frames(0xFF, sequence, [raw_param_byte(0x00)])
     response = bridge.raw_exchange_on_handle(handle, device, 0xFF, frames, sequence, 2000, expect_response=False)
     print("Sent reboot command", flush=True)
     return response
-
-
-def raw_reboot_device(bridge: HarmonyUsbBridge) -> RawResponse:
-    handle, device = bridge.open_handle()
-    try:
-        return raw_reboot_device_on_handle(bridge, handle, device)
-    finally:
-        handle.close()
 
 
 def decode_raw_text(data: bytes) -> str:
@@ -3008,10 +2536,6 @@ def wifi_connect_payload(args: argparse.Namespace) -> bytes:
         raise UsbBridgeError("Wi-Fi properties could not be encoded as UTF-8.") from exc
 
 
-def command_log_put(bridge: HarmonyUsbBridge, file_name: str, body: str) -> Response:
-    return bridge.invoke("harmony.log?put", {"resource": [{"fileName": file_name, "data": body}]})
-
-
 def redact(obj: Any, show_ssids: bool = False, name: str = "") -> Any:
     low = name.lower()
     if low in {"password", "passphrase", "psk", "key"}:
@@ -3027,80 +2551,6 @@ def redact(obj: Any, show_ssids: bool = False, name: str = "") -> Any:
     if isinstance(obj, list):
         return [redact(v, show_ssids, name) for v in obj]
     return obj
-
-
-def response_summary(response: Response, raw_output: bool = False, show_ssids: bool = False) -> Any:
-    payload = redact(response.payload_object, show_ssids) if show_ssids or response.payload_object else response.payload_object
-    if raw_output or not response.payload_object:
-        summary = {
-            "command": response.command,
-            "appRequestId": response.app_request_id,
-            "attempt": response.attempt,
-            "attempts": response.attempts,
-            "matchedResponse": response.matched_response,
-            "drain": response.drain,
-            "complete": response.decode.complete,
-            "error": response.decode.error,
-            "payloadLength": response.decode.payload_length,
-            "payload": payload if payload is not None else response.decode.payload,
-            "rawResponseLength": response.raw_response_length,
-            "rawResponseHex": response.raw_response_hex,
-            "readReports": response.read_reports,
-            "candidates": response.candidate_decodes,
-        }
-        hint = empty_hid_read_hint(response)
-        if hint:
-            summary["windowsHidHint"] = hint
-        return summary
-    return payload
-
-
-def write_response(response: Response, args: argparse.Namespace, redacted: bool = False) -> None:
-    payload = response_summary(response, args.raw_output, args.show_ssids if redacted else True)
-    if redacted and not args.show_ssids:
-        payload = redact(payload, False)
-    print(pretty_json(payload))
-
-
-def windows_usb_owner_processes() -> list[str]:
-    if not sys.platform.startswith("win"):
-        return []
-    try:
-        proc = subprocess.run(
-            ["tasklist", "/fo", "csv", "/nh"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except Exception:
-        return []
-    if proc.returncode != 0:
-        return []
-
-    names: set[str] = set()
-    for row in csv.reader(proc.stdout.splitlines()):
-        if not row:
-            continue
-        name = row[0].strip().lower()
-        if name in WINDOWS_USB_OWNER_PROCESS_NAMES:
-            names.add(row[0].strip())
-    return sorted(names, key=str.lower)
-
-
-def empty_hid_read_hint(response: Response) -> dict[str, Any] | None:
-    if not sys.platform.startswith("win"):
-        return None
-    if response.raw_response_length or response.read_reports:
-        return None
-
-    owners = windows_usb_owner_processes()
-    hint: dict[str, Any] = {
-        "message": "The hub opened over USB, but no HID input reports came back. Close MyHarmony, Edge IE-mode recovery pages, Internet Explorer, and Logitech plugin services, then reconnect the hub USB cable.",
-    }
-    if owners:
-        hint["possibleUsbOwnerProcesses"] = owners
-    return hint
 
 
 def tcp_port_open(address: str, port: int, timeout: float = 2.5) -> bool:
@@ -3142,9 +2592,6 @@ def run_drain(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
 def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
     _, device = bridge.get_device()
     sysinfo = raw_read_file(bridge, RAW_DEVICE_INFO_PATH, 50, max(args.timeout_ms, 25000))
-    write_result = None
-    if args.write_probe:
-        write_result = command_log_put(bridge, "codex-usb-preflight.txt", "ok " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
     out = {
         "device": {
             "backend": device.backend,
@@ -3156,24 +2603,11 @@ def run_preflight(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
         },
         "transport": {
             "timeoutMs": args.timeout_ms,
-            "retryCount": args.retry_count,
-            "retryDelayMs": args.retry_delay_ms,
             "drainReports": args.drain_reports,
             "drainWaitMs": args.drain_wait_ms,
-            "looseResponseMatch": args.loose_response_match,
         },
         "sysinfo": raw_file_summary(sysinfo, args.show_ssids),
-        "writeProbe": None,
     }
-    if write_result:
-        out["writeProbe"] = {
-            "code": response_code(write_result),
-            "complete": write_result.decode.complete,
-            "matchedResponse": write_result.matched_response,
-            "appRequestId": write_result.app_request_id,
-            "attempt": write_result.attempt,
-            "attempts": write_result.attempts,
-        }
     print(pretty_json(out))
 
 
@@ -3635,6 +3069,10 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
 
 
 def dry_run(args: argparse.Namespace) -> None:
+    if args.action in {"probe", "drain"}:
+        steps = ["enumerate"] if args.action == "probe" else ["open", "read", "close"]
+        print(pretty_json({"dryRun": True, "action": args.action, "protocol": "usb-hid", "steps": steps}))
+        return
     if args.action == "factory-reset":
         print(pretty_json({"dryRun": True, "action": "factory-reset", "steps": ["write /sys/factoryreset", "write /sys/reboot"]}))
         return
@@ -3661,41 +3099,10 @@ def dry_run(args: argparse.Namespace) -> None:
         print(pretty_json({"dryRun": True, "action": args.action, "protocol": "raw-file", "remotePath": RAW_WIFI_CONNECT_PATH, "steps": ["open", "write", "close"], "bytes": len(payload)}))
         return
 
-    sample_data: Any = ""
-    command_name = "sys.info"
-    timeout_ms = args.timeout_ms
-    if args.action == "wifi-status":
-        command_name = "wifi.status"
-        sample_data = {"donotresolve": 1}
-    elif args.action == "wifi-scan":
-        command_name = "wifi.networks"
-        sample_data = {}
-        timeout_ms = max(timeout_ms, 60000)
-    elif args.action in {"wifi-connect", "provision-wifi"}:
-        command_name = "wifi.connect"
-        sample_data = {
-            "ssid": args.ssid or "<ssid>",
-            "password": "<redacted>",
-            "encryption": args.encryption or "WPA2-PSK",
-        }
-        if args.no_save:
-            sample_data["nosave"] = True
-        timeout_ms = max(timeout_ms, 40000)
-    request = {"id": 123456, "cmd": command_name, "data": sample_data, "timeout": 5}
-    frames = new_ltcp_frames(compact_json(request))
-    print(pretty_json({"dryRun": True, "action": args.action, "command": command_name, "timeoutMs": timeout_ms, "frameCount": len(frames), "firstFrameHex": hex_string(frames[0])}))
+    raise UsbBridgeError(f"Unknown action: {args.action}")
 
 
 def self_test() -> None:
-    request = compact_json({"id": 123456, "cmd": "sys.info", "data": "", "timeout": 5})
-    frames = new_ltcp_frames(request)
-    assert len(frames) >= 1
-    raw = b"".join(frames)
-    decoded = decode_ltcp(raw)
-    assert decoded.complete, decoded
-    assert decoded.payload == request, decoded.payload
-    candidates = ltcp_candidates(raw)
-    assert candidates and candidates[-1].complete
     assert raw_param_string("R") == b"\x80R\x00"
     assert raw_param_word(0x1234) == b"\x02\x34\x12"
     assert raw_param_dword(0x12345678) == b"\x04\x78\x56\x34\x12"
@@ -3763,15 +3170,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vendor-id", default="046D")
     parser.add_argument("--product-id", default="C129")
     parser.add_argument("--timeout-ms", type=int, default=12000)
-    parser.add_argument("--retry-count", type=int, default=2)
     parser.add_argument("--retry-delay-ms", type=int, default=250)
     parser.add_argument("--drain-reports", type=int, default=32)
     parser.add_argument("--drain-wait-ms", type=int, default=40)
     parser.add_argument("--resync-attempts", type=int, default=6)
     parser.add_argument("--raw-output", action="store_true")
-    parser.add_argument("--no-drain", action="store_true")
-    parser.add_argument("--loose-response-match", action="store_true")
-    parser.add_argument("--write-probe", action="store_true")
     parser.add_argument("--hub-ip", default="")
     parser.add_argument("--ssid", default="")
     parser.add_argument("--wifi-password", default="")
@@ -3858,7 +3261,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         raise SystemExit("\nInterrupted")
-    except (UsbBridgeError, OSError, subprocess.CalledProcessError) as exc:
+    except (UsbBridgeError, OSError) as exc:
         print("", file=sys.stderr)
         print("ERROR:", file=sys.stderr)
         print(str(exc), file=sys.stderr)

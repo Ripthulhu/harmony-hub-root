@@ -515,16 +515,6 @@ def extract_numeric_ids(text: str) -> list[str]:
     return ids
 
 
-def saved_hub_id_files() -> list[pathlib.Path]:
-    return [
-        pathlib.Path.home() / ".harmony-hub" / "hub_id.txt",
-        pathlib.Path.home() / ".harmony-hub" / "last_root.json",
-        pathlib.Path.home() / ".harmony-hub" / "known_hubs.json",
-        SCRIPT_DIR / "harmony_hub_id.json",
-        SCRIPT_DIR / "harmony_hub_id.txt",
-    ]
-
-
 def delete_saved_hub_ids(host: str) -> list[str]:
     """Delete/scrub cached Hub ID handoff files.
 

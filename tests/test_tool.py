@@ -117,6 +117,16 @@ class ToolTests(unittest.TestCase):
                     with self.subTest(action=action):
                         tool.main(["--action", action, "--dry-run"])
 
+    def test_usb_direct_dry_runs_cover_each_action(self):
+        for action in usb.ACTION_CHOICES:
+            if action == "flash-firmware":
+                continue
+            with self.subTest(action=action):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    usb.dry_run(usb.parse_args(["--action", action, "--dry-run"]))
+                self.assertEqual(json.loads(output.getvalue())["action"], action)
+
     def test_missing_firmware_dry_run_does_not_prompt(self):
         with patch("builtins.input", side_effect=AssertionError), self.assertRaises(usb.UsbBridgeError):
             tool.main(["--action", "usb-flash-firmware", "--dry-run"])
@@ -264,6 +274,11 @@ class ToolTests(unittest.TestCase):
     def test_usb_self_test(self):
         usb.self_test()
 
+    def test_checksum_case_variants_keep_descriptor_first(self):
+        expected = [("descriptor", "aB"), ("upper", "AB"), ("lower", "ab")]
+        self.assertEqual(usb.checksum_case_variants("aB", "auto", "case"), expected)
+        self.assertEqual(usb.checksum_case_variants("aB", "auto", "type"), expected)
+
 
 class LauncherTests(unittest.TestCase):
     def invoke(self, prefix, args, cwd=None):
@@ -278,9 +293,6 @@ class LauncherTests(unittest.TestCase):
     def test_platform_launchers_preserve_exit_codes(self):
         if os.name == "nt":
             prefixes = [["cmd.exe", "/d", "/c", str(tool.SCRIPT_DIR / "Start_Harmony_Hub_Tool.cmd")]]
-            powershell = shutil.which("powershell.exe")
-            if powershell:
-                prefixes.append([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tool.SCRIPT_DIR / "run_harmony_hub_tool.ps1")])
         else:
             prefixes = [["sh", str(tool.SCRIPT_DIR / "run_harmony_hub_tool.sh")]]
         for prefix in prefixes:
