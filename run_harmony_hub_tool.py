@@ -9,10 +9,13 @@ import pathlib
 import subprocess
 import sys
 
+if sys.version_info < (3, 10):
+    raise SystemExit("Python 3.10 or newer is required.")
+
+import harmony_xmpp_root_shell as lan
+import harmony_usb_bridge as usb
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-LAN_TOOL_PATH = SCRIPT_DIR / "harmony_xmpp_root_shell.py"
-USB_BRIDGE_PATH = SCRIPT_DIR / "harmony_usb_bridge.py"
 ACTION_CHOICES = (
     "",
     "lan-root",
@@ -29,6 +32,8 @@ ACTION_CHOICES = (
 
 
 def read_action() -> str:
+    if not sys.stdin.isatty():
+        raise SystemExit("--action is required when running without an interactive terminal. See --help.")
     print("")
     print("Harmony Hub Tool")
     print("1. Give me root! (roots the device over LAN and enables SSH)")
@@ -58,28 +63,31 @@ def read_action() -> str:
 
 
 def resolve_host_alias(args: argparse.Namespace) -> None:
+    if args.hub_host and args.hub_ip and args.hub_host != args.hub_ip:
+        raise SystemExit("--hub-host and --hub-ip must refer to the same hub; supply only one.")
     if not args.hub_host and args.hub_ip:
         args.hub_host = args.hub_ip
     if not args.hub_ip and args.hub_host:
         args.hub_ip = args.hub_host
 
 
-def run_subprocess(argv: list[str]) -> None:
-    proc = subprocess.run(argv, cwd=SCRIPT_DIR, check=False)
-    if proc.returncode != 0:
-        raise SystemExit(proc.returncode)
+def prompt_value(label: str, flag: str, secret: bool = False) -> str:
+    if not sys.stdin.isatty():
+        raise SystemExit(f"{flag} is required without an interactive terminal.")
+    value = getpass.getpass(label) if secret else input(label)
+    if not value:
+        raise SystemExit(f"{flag} must not be empty.")
+    return value
 
 
 def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
     resolve_host_alias(args)
     if not args.hub_host and not args.dry_run:
-        args.hub_host = input("Harmony Hub IP address: ").strip()
+        args.hub_host = prompt_value("Harmony Hub IP address: ", "--hub-host").strip()
     dropbearmulti = args.dropbearmulti or str(SCRIPT_DIR / "dropbearmulti")
     private_key = args.private_key or str(pathlib.Path.home() / ".ssh" / "harmony_owner_ed25519")
     pubkey = args.pubkey or private_key + ".pub"
     argv = [
-        sys.executable,
-        str(LAN_TOOL_PATH),
         "--dropbearmulti",
         dropbearmulti,
         "--private-key",
@@ -93,6 +101,7 @@ def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
         argv += ["--hub-id", hub_id]
     if args.xmpp_enable_wait != 90:
         argv += ["--xmpp-enable-wait", str(args.xmpp_enable_wait)]
+    argv += ["--ssh-wait", str(args.ssh_wait)]
     if args.no_enable_xmpp:
         argv.append("--no-enable-xmpp")
     if enable_xmpp_only:
@@ -113,8 +122,6 @@ def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
 def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
     resolve_host_alias(args)
     argv = [
-        sys.executable,
-        str(USB_BRIDGE_PATH),
         "--action",
         usb_action,
         "--backend",
@@ -152,37 +159,39 @@ def usb_args(args: argparse.Namespace, usb_action: str) -> list[str]:
 
 
 def ensure_usb_prompt_args(args: argparse.Namespace, action: str) -> None:
-    if action == "usb-wifi-scan" and not args.show_ssids and not args.dry_run and not args.yes:
+    if args.dry_run:
+        return
+    if action == "usb-wifi-scan" and not (args.show_ssids or args.hide_ssids or args.yes) and sys.stdin.isatty():
         answer = input("Show SSIDs in scan output? [y/N]: ").strip().lower()
         if answer in {"y", "yes"}:
             args.show_ssids = True
     elif action == "usb-provision-wifi":
         resolve_host_alias(args)
         if not args.ssid and not args.dry_run:
-            args.ssid = input("Wi-Fi SSID: ").strip()
+            args.ssid = prompt_value("Wi-Fi SSID: ", "--ssid")
         if not args.encryption:
             args.encryption = "WPA2-PSK"
         if args.encryption.upper() not in {"NONE", "OPEN"} and args.wifi_password == "" and not args.dry_run:
-            args.wifi_password = getpass.getpass("Wi-Fi password: ")
+            args.wifi_password = prompt_value("Wi-Fi password: ", "--wifi-password", secret=True)
         if args.dry_run:
             return
-        if not args.wait_for_lan and not args.yes:
+        if not args.wait_for_lan and not args.yes and sys.stdin.isatty():
             answer = input("Wait for LAN reachability after provisioning? [y/N]: ").strip().lower()
             if answer in {"y", "yes"}:
                 args.wait_for_lan = True
         if args.wait_for_lan and not args.hub_ip:
-            args.hub_ip = input("Expected hub IP for LAN check: ").strip()
+            args.hub_ip = prompt_value("Expected hub IP for LAN check: ", "--hub-ip").strip()
     elif action == "usb-flash-firmware":
         if not args.firmware_file:
-            args.firmware_file = input("Path to .hfw2 firmware file: ").strip().strip('"')
+            args.firmware_file = prompt_value("Path to .hfw2 firmware file: ", "--firmware-file").strip().strip('"')
     elif action == "usb-factory-reset":
         return
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified Harmony Hub tool")
     parser.add_argument("--action", choices=ACTION_CHOICES, default="")
-    parser.add_argument("--hub-host", default="")
+    parser.add_argument("--hub-host", "--host", default="", help="Hub IP address or hostname for LAN actions")
     parser.add_argument("--hub-ip", default="")
     parser.add_argument("--hub-id", action="append", default=[])
     parser.add_argument("--ignore-saved-hub-id", action="store_true", help="do not use cached Hub IDs for LAN/XMPP actions")
@@ -192,68 +201,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pubkey", default="")
     parser.add_argument("--dropbearmulti", default="")
     parser.add_argument("--xmpp-enable-wait", type=int, default=90)
+    parser.add_argument("--ssh-wait", type=int, default=120)
     parser.add_argument("--no-enable-xmpp", action="store_true")
     parser.add_argument("--no-shell", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Validate locally without contacting a hub, prompting, or changing files")
     parser.add_argument("--usb-backend", choices=("auto", "hidapi", "hidraw", "winhid"), default="auto")
     parser.add_argument("--ssid", default="")
-    parser.add_argument("--wifi-password", default="")
+    parser.add_argument("--wifi-password", default="", help="Prefer the hidden interactive prompt; command-line secrets may be visible to other processes")
     parser.add_argument("--encryption", default="WPA2-PSK")
     parser.add_argument("--no-save", action="store_true")
-    parser.add_argument("--show-ssids", action="store_true")
-    parser.add_argument("--hide-ssids", action="store_true")
+    ssids = parser.add_mutually_exclusive_group()
+    ssids.add_argument("--show-ssids", action="store_true")
+    ssids.add_argument("--hide-ssids", action="store_true")
     parser.add_argument("--raw-output", action="store_true")
     parser.add_argument("--save-hub-id", action="store_true", help="save a USB-discovered Hub ID for LAN/XMPP actions")
     parser.add_argument("--wait-for-lan", action="store_true")
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
     parser.add_argument("--firmware-file", default="")
-    parser.add_argument("--target-skin", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=500)
-    parser.add_argument("--yes", action="store_true")
-    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
-    return parser.parse_args()
+    parser.add_argument("--yes", action="store_true", help="Confirm USB reset/flash; does not supply missing settings")
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    if args.dry_run and not args.action:
+        raise SystemExit("--dry-run requires an explicit --action.")
     action = args.action or read_action()
     if action == "lan-root":
-        print("Running Harmony Hub Give me root! LAN flow...", flush=True)
-        run_subprocess(lan_args(args, False))
+        print("Running Harmony Hub LAN root installer...", flush=True)
+        lan.main(lan_args(args, False))
     elif action == "enable-xmpp":
         print("Running Harmony Hub XMPP enable flow...", flush=True)
-        run_subprocess(lan_args(args, True))
-    elif action == "usb-preflight":
-        print("Running Harmony Hub USB bridge action: preflight", flush=True)
-        run_subprocess(usb_args(args, "preflight"))
-    elif action == "usb-sysinfo":
-        print("Running Harmony Hub USB bridge action: sysinfo", flush=True)
-        run_subprocess(usb_args(args, "sysinfo"))
-    elif action == "usb-hub-id":
-        print("Running Harmony Hub USB bridge action: hub-id", flush=True)
-        args.save_hub_id = True
-        run_subprocess(usb_args(args, "hub-id"))
-    elif action == "usb-wifi-status":
-        print("Running Harmony Hub USB bridge action: wifi-status", flush=True)
-        run_subprocess(usb_args(args, "wifi-status"))
-    elif action == "usb-wifi-scan":
+        lan.main(lan_args(args, True))
+    elif action.startswith("usb-"):
         ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: wifi-scan", flush=True)
-        run_subprocess(usb_args(args, "wifi-scan"))
-    elif action == "usb-provision-wifi":
-        ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: change-wifi", flush=True)
-        run_subprocess(usb_args(args, "provision-wifi"))
-    elif action == "usb-factory-reset":
-        ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: factory-reset", flush=True)
-        print("After factory reset, set the hub up again with the Harmony app before normal use.", flush=True)
-        run_subprocess(usb_args(args, "factory-reset"))
-    elif action == "usb-flash-firmware":
-        ensure_usb_prompt_args(args, action)
-        print("Running Harmony Hub USB bridge action: flash-firmware", flush=True)
-        run_subprocess(usb_args(args, "flash-firmware"))
+        usb_action = action.removeprefix("usb-")
+        print(f"Running Harmony Hub USB action: {usb_action}", flush=True)
+        # Keep prompted credentials in this process, not a child process command line.
+        usb.main(usb_args(args, usb_action))
     else:
         raise SystemExit(f"Unknown action: {action}")
 
@@ -262,4 +249,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        raise SystemExit("\nInterrupted")
+        print("\nInterrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except (EOFError, OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

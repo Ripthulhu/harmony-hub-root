@@ -50,7 +50,7 @@ DEFAULT_FIRMWARE_DATA_LENGTH_MODE = "length"
 DEFAULT_FIRMWARE_CHECKSUM_CASE = "descriptor"
 DEFAULT_FIRMWARE_CHECKSUM_TYPE = "descriptor"
 DEFAULT_FIRMWARE_CHECKSUM_ENDIAN = "big"
-USB_LOCK_PATH = SCRIPT_DIR / ".harmony_usb_bridge.lock"
+USB_LOCK_PATH = pathlib.Path.home() / ".harmony-hub" / "usb.lock"
 RAW_DEVICE_INFO_PATH = "/rf/deviceinfo"
 RAW_WIFI_STATUS_PATH = "/sys/wifi/connect"
 RAW_WIFI_NETWORKS_PATH = "/sys/wifi/networks"
@@ -215,10 +215,7 @@ def parse_hex_int(value: str | int) -> int:
 
 
 def resolve_local_path(value: str) -> pathlib.Path:
-    path = pathlib.Path(value).expanduser()
-    if path.is_absolute():
-        return path
-    return SCRIPT_DIR / path
+    return pathlib.Path(value).expanduser()
 
 
 def compact_json(obj: Any) -> str:
@@ -233,9 +230,9 @@ def pretty_json(obj: Any) -> str:
 def usb_process_lock() -> Any:
     USB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with USB_LOCK_PATH.open("a+b") as lock_file:
-        lock_file.seek(0)
-        lock_file.write(b"\0")
-        lock_file.flush()
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
         if sys.platform.startswith("win"):
             import msvcrt
 
@@ -307,6 +304,8 @@ def find_zip_member(names: list[str], basename: str) -> str:
     matches = [name for name in names if pathlib.PurePosixPath(name).name.lower() == wanted]
     if not matches:
         raise UsbBridgeError(f"{basename} not found in firmware bundle")
+    if len(matches) != 1:
+        raise UsbBridgeError(f"ambiguous firmware bundle: multiple entries for {basename}")
     return matches[0]
 
 
@@ -364,6 +363,8 @@ def parse_hfw2_bundle(path_value: str) -> FirmwareBundle:
             checksum_offset = parse_descriptor_int(checksum_node.get("OFFSET") or "0")
             checksum_length = parse_descriptor_int(checksum_node.get("LENGTH") or str(len(data)))
             checksum_expected = (checksum_node.get("EXPECTEDVALUE") or "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{32}", checksum_expected):
+                raise UsbBridgeError(f"{image_name} has no valid expected MD5 checksum")
             if checksum_type_normalized != "MD5":
                 raise UsbBridgeError(f"{image_name} uses unsupported checksum type {checksum_type!r}; expected MD5")
             if checksum_seed != 0:
@@ -371,7 +372,7 @@ def parse_hfw2_bundle(path_value: str) -> FirmwareBundle:
             if checksum_offset < 0 or checksum_length < 0 or checksum_offset + checksum_length > len(data):
                 raise UsbBridgeError(f"{image_name} checksum range is outside the payload")
             actual = md5_bytes(data[checksum_offset : checksum_offset + checksum_length])
-            if checksum_expected and actual.lower() != checksum_expected.lower():
+            if actual.lower() != checksum_expected.lower():
                 raise UsbBridgeError(f"{image_name} checksum mismatch: expected {checksum_expected}, got {actual}")
 
             images.append(
@@ -1015,20 +1016,24 @@ def make_backends(name: str) -> list[HidBackend]:
     if name == "hidapi":
         return [HidApiBackend()]
     if name == "hidraw":
+        if not sys.platform.startswith("linux"):
+            raise UsbBridgeError("The hidraw backend requires Linux.")
         return [LinuxHidrawBackend()]
     if name == "winhid":
+        if not sys.platform.startswith("win"):
+            raise UsbBridgeError("The winhid backend requires Windows.")
         return [WindowsNativeBackend()]
     backends: list[HidBackend] = []
+    if sys.platform.startswith("win"):
+        backends.append(WindowsNativeBackend())
     try:
         backends.append(HidApiBackend())
     except UsbBridgeError:
         pass
-    if sys.platform.startswith("win"):
-        try:
-            backends.append(WindowsNativeBackend())
-        except UsbBridgeError:
-            pass
-    backends.append(LinuxHidrawBackend())
+    if sys.platform.startswith("linux"):
+        backends.append(LinuxHidrawBackend())
+    if not backends:
+        raise UsbBridgeError("USB support requires hidapi on this OS. Install requirements-usb.txt with this Python interpreter.")
     return backends
 
 
@@ -2973,7 +2978,7 @@ def run_hub_id(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
         "writtenFiles": written,
     }
     if args.raw_output:
-        out["sysinfo"] = raw_file_summary(read, show_ssids=True)
+        out["sysinfo"] = raw_file_summary(read, show_ssids=display_ssids_for_scan(args))
     elif not hub_id:
         out["note"] = (
             "No confirmed WebSocket Hub ID-like field was found in /rf/deviceinfo. "
@@ -2985,14 +2990,19 @@ def run_hub_id(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
 def wifi_connect_payload(args: argparse.Namespace) -> bytes:
     encryption = args.encryption.strip() or "WPA2-PSK"
     rows = [
-        ("ssid", args.ssid.strip()),
+        ("ssid", args.ssid),
         ("password", args.wifi_password),
         ("encryption", encryption),
     ]
     if args.no_save:
         rows.append(("nosave", "true"))
+    for name, value in rows:
+        if any(char in value for char in ("\r", "\n", "\0")):
+            raise UsbBridgeError(f"Wi-Fi {name} must not contain newlines or NUL bytes.")
     text = "".join(f"{key},{value}\n" for key, value in rows)
     try:
+        if not 1 <= len(args.ssid.encode("utf-8")) <= 32:
+            raise UsbBridgeError("Wi-Fi SSID must be between 1 and 32 UTF-8 bytes.")
         return text.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise UsbBridgeError("Wi-Fi properties could not be encoded as UTF-8.") from exc
@@ -3315,7 +3325,7 @@ def ssid_label(args: argparse.Namespace) -> str:
 
 
 def run_wifi_connect(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> None:
-    if not args.ssid.strip():
+    if not args.ssid:
         raise UsbBridgeError("--ssid is required for --action wifi-connect/provision-wifi.")
     encryption = args.encryption.strip() or "WPA2-PSK"
     if encryption.upper() not in {"NONE", "OPEN"} and args.wifi_password == "":
@@ -3513,7 +3523,7 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
             f"checksum_type={args.firmware_checksum_type} "
             f"checksum_endian={args.firmware_checksum_endian} "
             f"checksum_retries={args.firmware_checksum_retries} "
-            f"finalize=official(close+reset even when checksum != m; flush only when checksum == m)",
+            f"finalize=close, reboot only after accepted handoff; flush only when checksum == m",
             flush=True,
         )
         for image in bundle.images:
@@ -3570,7 +3580,7 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
             # close + reboot hands the staged OTA package to the boot updater.
             # The observed post-reboot success marker is /cache/ota-update.log
             # containing mtd writes, sha1 verified lines, and Done!.
-            boot_handoff_result = checksum_result_byte == ord("u")
+            boot_handoff_result = image.remote_path == "/fw/otaupdate" and checksum_result_byte == ord("u")
             firmware_handoff_ok = closed and close_error == "" and (checksum_ok or boot_handoff_result)
             result_mode = (
                 "usbChecksumMatchedAndCommitted"
@@ -3599,13 +3609,14 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
                 }
             )
 
+        handoff_ok = bool(image_results) and all(item["firmwareHandoffOk"] for item in image_results)
         reboot_requested = any(image.reset for image in bundle.images)
-        if reboot_requested:
+        reboot_performed = reboot_requested and handoff_ok
+        if reboot_performed:
             print("Rebooting per firmware bundle RESET flag / official finalize path", flush=True)
             raw_reboot_device_on_handle(bridge, handle, device)
     finally:
         handle.close()
-    handoff_ok = bool(image_results) and all(item["firmwareHandoffOk"] for item in image_results)
     print(
         pretty_json(
             {
@@ -3613,11 +3624,14 @@ def run_flash_firmware(bridge: HarmonyUsbBridge, args: argparse.Namespace) -> No
                 "action": "flash-firmware",
                 "usbHandoffOk": handoff_ok,
                 "images": image_results,
-                "reboot": reboot_requested if 'reboot_requested' in locals() else any(image.reset for image in bundle.images),
+                "rebootRequested": reboot_requested,
+                "reboot": reboot_performed,
                 "postRebootValidation": "cat /cache/ota-update.log and confirm sha1 verified + Done!",
             }
         )
     )
+    if not handoff_ok:
+        raise UsbBridgeError("Firmware upload did not pass the hub's checksum/close checks; reboot was skipped.")
 
 
 def dry_run(args: argparse.Namespace) -> None:
@@ -3741,7 +3755,7 @@ def self_test() -> None:
     print("USB bridge self-test OK")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Harmony Hub USB HID/LTCP bridge")
     parser.add_argument("--action", choices=ACTION_CHOICES, default="preflight")
     parser.add_argument("--backend", choices=("auto", "hidapi", "hidraw", "winhid"), default="auto")
@@ -3763,14 +3777,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wifi-password", default="")
     parser.add_argument("--encryption", default="WPA2-PSK")
     parser.add_argument("--no-save", action="store_true")
-    parser.add_argument("--show-ssids", action="store_true", help="show SSIDs in Wi-Fi scan/raw output")
-    parser.add_argument("--hide-ssids", action="store_true", help="hide SSIDs even in Wi-Fi status/provisioning summaries")
+    ssids = parser.add_mutually_exclusive_group()
+    ssids.add_argument("--show-ssids", action="store_true", help="show SSIDs in Wi-Fi scan/raw output")
+    ssids.add_argument("--hide-ssids", action="store_true", help="hide SSIDs even in Wi-Fi status/provisioning summaries")
     parser.add_argument("--save-hub-id", action="store_true", help="save discovered Hub ID for the LAN root/XMPP tool")
     parser.add_argument("--wait-for-lan", action="store_true")
     parser.add_argument("--lan-port", type=int, default=8088)
     parser.add_argument("--lan-wait-seconds", type=int, default=90)
     parser.add_argument("--firmware-file", default="")
-    parser.add_argument("--target-skin", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--firmware-packets-per-chunk", type=int, default=DEFAULT_FIRMWARE_PACKETS_PER_CHUNK)
     parser.add_argument("--firmware-packet-count-width", choices=("byte", "word"), default=DEFAULT_FIRMWARE_PACKET_COUNT_WIDTH)
     parser.add_argument("--firmware-frame-delay-ms", type=int, default=DEFAULT_FIRMWARE_FRAME_DELAY_MS)
@@ -3784,10 +3798,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--firmware-checksum-retries", type=int, default=DEFAULT_FIRMWARE_CHECKSUM_RETRIES)
     parser.add_argument("--firmware-checksum-retry-delay-ms", type=int, default=DEFAULT_FIRMWARE_CHECKSUM_RETRY_DELAY_MS)
     parser.add_argument("--yes", action="store_true")
-    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if not 1 <= args.lan_port <= 65535:
+        parser.error("--lan-port must be between 1 and 65535")
+    if args.lan_wait_seconds <= 0 or args.timeout_ms <= 0:
+        parser.error("timeouts must be positive")
+    packet_limit = 255 if args.firmware_packet_count_width == "byte" else 65535
+    if not 1 <= args.firmware_packets_per_chunk <= packet_limit:
+        parser.error(f"--firmware-packets-per-chunk must be between 1 and {packet_limit}")
+    return args
 
 
 def run_action(args: argparse.Namespace) -> None:
@@ -3819,8 +3840,8 @@ def run_action(args: argparse.Namespace) -> None:
         raise UsbBridgeError(f"Unknown action: {args.action}")
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if args.self_test:
         self_test()
         return

@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
 from xml.sax.saxutils import escape
@@ -220,6 +221,7 @@ class XmppTransport:
         self.port = port
         self.sock: socket.socket | None = None
         self.counter = 0
+        self._incoming = b""
 
     def __enter__(self) -> "XmppTransport":
         self.open()
@@ -235,20 +237,25 @@ class XmppTransport:
         )
         token = base64.b64encode(b"\x00harmony-root-tool\x00x").decode("ascii")
         sock = socket.create_connection((self.host, self.port), timeout=8)
-        sock.settimeout(2)
-        sock.sendall(stream.encode("utf-8"))
-        recv_until(sock, [b"</stream:features>"], 4)
-        auth = (
-            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' "
-            f"mechanism='PLAIN'>{token}</auth>"
-        )
-        sock.sendall(auth.encode("utf-8"))
-        auth_response = recv_until(sock, [b"success", b"failure"], 5)
-        if "<success" not in auth_response:
-            raise RuntimeError("XMPP auth failed: " + auth_response[:500])
-        sock.sendall(stream.encode("utf-8"))
-        recv_until(sock, [b"</stream:features>"], 4)
+        try:
+            sock.settimeout(2)
+            sock.sendall(stream.encode("utf-8"))
+            recv_until(sock, [b"</stream:features>"], 4)
+            auth = (
+                "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' "
+                f"mechanism='PLAIN'>{token}</auth>"
+            )
+            sock.sendall(auth.encode("utf-8"))
+            auth_response = recv_until(sock, [b"success", b"failure"], 5)
+            if "<success" not in auth_response:
+                raise RuntimeError("XMPP auth failed: " + auth_response[:500])
+            sock.sendall(stream.encode("utf-8"))
+            recv_until(sock, [b"</stream:features>"], 4)
+        except BaseException:
+            sock.close()
+            raise
         self.sock = sock
+        self._incoming = b""
 
     def close(self) -> None:
         if self.sock:
@@ -272,17 +279,40 @@ class XmppTransport:
             "</iq>"
         )
         self.sock.sendall(stanza.encode("utf-8"))
-        raw = recv_until(
-            self.sock,
-            [f"id='{cmd_id}'".encode("ascii"), f'id="{cmd_id}"'.encode("ascii"), b"</iq>"],
-            timeout=timeout,
-        )
+        raw = self.receive_iq(cmd_id, timeout)
         return XmppResponse(
             raw=raw,
             code=extract_attr(raw, "errorcode"),
             error=extract_attr(raw, "errorstring"),
             payload=extract_payload(raw),
         )
+
+    def receive_iq(self, cmd_id: str, timeout: float) -> str:
+        """Wait for the complete matching stanza, retaining fragmented TCP data."""
+        assert self.sock is not None
+        deadline = time.monotonic() + timeout
+        while True:
+            match = re.search(rb"<iq\b[^>]*(?:/>|>.*?</iq\s*>)", self._incoming, re.S)
+            if match:
+                raw = match.group().decode("utf-8")
+                self._incoming = self._incoming[match.end():]
+                stanza = ET.fromstring(raw)
+                if stanza.get("id") == cmd_id:
+                    return raw
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for complete XMPP reply {cmd_id}")
+            self.sock.settimeout(min(remaining, 2))
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise ConnectionError(f"XMPP disconnected before completing reply {cmd_id}")
+            self._incoming += chunk
+            if len(self._incoming) > 2_000_000:
+                raise RuntimeError("XMPP reply exceeds the 2 MB receive limit")
 
 
 class WebSocketTransport:
@@ -293,45 +323,70 @@ class WebSocketTransport:
         self.domain = domain
 
     @staticmethod
-    def _frame(payload: bytes) -> bytes:
+    def _frame(payload: bytes, opcode: int = 1) -> bytes:
         mask = os.urandom(4)
         length = len(payload)
         if length < 126:
-            header = struct.pack("!BB", 0x81, 0x80 | length)
+            header = struct.pack("!BB", 0x80 | opcode, 0x80 | length)
         elif length < 65536:
-            header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, length)
         else:
-            header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
         return header + mask + bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
 
     @staticmethod
-    def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    def _recv_exact(sock: socket.socket, size: int, pending: bytearray | None = None) -> bytes:
         out = b""
+        if pending:
+            out = bytes(pending[:size])
+            del pending[:size]
         while len(out) < size:
             chunk = sock.recv(size - len(out))
             if not chunk:
-                break
+                raise ConnectionError("WebSocket disconnected before completing a frame")
             out += chunk
         return out
 
-    def _recv_ws(self, sock: socket.socket, timeout: float) -> str:
-        sock.settimeout(timeout)
-        head = self._recv_exact(sock, 2)
-        if len(head) < 2:
-            return ""
-        first, second = head
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", self._recv_exact(sock, 2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
-        payload = self._recv_exact(sock, length)
-        if second & 0x80:
-            mask, payload = payload[:4], payload[4:]
-            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
-        if first & 0x0F == 8:
-            return ""
-        return payload.decode("utf-8", "replace")
+    def _recv_ws(self, sock: socket.socket, timeout: float, pending: bytearray | None = None) -> str:
+        deadline = time.monotonic() + timeout
+        message = bytearray()
+        started = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for WebSocket message")
+            sock.settimeout(remaining)
+            first, second = self._recv_exact(sock, 2, pending)
+            opcode, final = first & 0x0F, bool(first & 0x80)
+            if first & 0x70:
+                raise RuntimeError("Unsupported WebSocket extensions")
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(sock, 2, pending))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(sock, 8, pending))[0]
+            if length > 2_000_000 or len(message) + length > 2_000_000:
+                raise RuntimeError("WebSocket reply exceeds the 2 MB receive limit")
+            if opcode >= 8 and (not final or length > 125):
+                raise RuntimeError("Invalid WebSocket control frame")
+            mask = self._recv_exact(sock, 4, pending) if second & 0x80 else b""
+            payload = self._recv_exact(sock, length, pending)
+            if mask:
+                payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+            if opcode == 8:
+                raise ConnectionError("Hub closed the WebSocket before replying")
+            if opcode == 9:
+                sock.sendall(self._frame(payload, opcode=10))
+                continue
+            if opcode == 10:
+                continue
+            if opcode == 1 and not started:
+                started = True
+            elif opcode != 0 or not started:
+                raise RuntimeError("Unexpected WebSocket data frame")
+            message.extend(payload)
+            if final:
+                return message.decode("utf-8")
 
     def call(self, cmd: str, params: Any, timeout: int = 20) -> dict[str, Any]:
         call_id = f"xroot-{int(time.time() * 1000)}"
@@ -347,14 +402,32 @@ class WebSocketTransport:
         )
         with socket.create_connection((self.host, self.port), timeout=8) as sock:
             sock.sendall(request.encode("ascii"))
-            headers = sock.recv(4096).decode("utf-8", "replace")
-            if "101 Switching Protocols" not in headers:
+            received = bytearray()
+            while b"\r\n\r\n" not in received:
+                part = sock.recv(4096)
+                if not part:
+                    raise ConnectionError("Hub disconnected during WebSocket upgrade")
+                received.extend(part)
+                if len(received) > 65536:
+                    raise RuntimeError("WebSocket upgrade headers exceed 64 KB")
+            header_bytes, remainder = bytes(received).split(b"\r\n\r\n", 1)
+            headers = header_bytes.decode("iso-8859-1")
+            if headers.splitlines()[0].split()[1:2] != ["101"]:
                 raise RuntimeError("websocket upgrade failed: " + headers[:500])
+            fields = dict(line.lower().split(":", 1) for line in headers.splitlines()[1:] if ":" in line)
+            expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+            # Header names are case-insensitive; the accept value is not.
+            accept = next((line.split(":", 1)[1].strip() for line in headers.splitlines()[1:] if line.lower().startswith("sec-websocket-accept:")), "")
+            if fields.get("upgrade", "").strip() != "websocket" or accept != expected:
+                raise RuntimeError("Invalid WebSocket upgrade response")
             sock.sendall(self._frame(json.dumps(body, separators=(",", ":")).encode("utf-8")))
-            reply = self._recv_ws(sock, timeout + 8)
-        if not reply:
-            raise RuntimeError(f"empty WebSocket response for {cmd}")
-        return json.loads(reply)
+            pending = bytearray(remainder)
+            deadline = time.monotonic() + timeout + 8
+            while True:
+                reply = json.loads(self._recv_ws(sock, deadline - time.monotonic(), pending))
+                hbus = reply.get("hbus", reply) if isinstance(reply, dict) else {}
+                if isinstance(hbus, dict) and hbus.get("id", call_id) == call_id and response_code(reply):
+                    return reply
 
 
 def response_code(obj: Any) -> str:
@@ -729,13 +802,7 @@ def collect_xmpp_enable_hub_ids(
 
 
 def resolve_input_path(value: str) -> pathlib.Path:
-    path = pathlib.Path(value).expanduser()
-    if path.exists():
-        return path
-    relative = SCRIPT_DIR / value
-    if relative.exists():
-        return relative
-    return path
+    return pathlib.Path(value).expanduser()
 
 
 def default_key_path() -> pathlib.Path:
@@ -765,6 +832,12 @@ def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
     except OSError as exc:
         raise SystemExit(f"cannot access SSH key path {private_key}: {exc}") from exc
     if private_exists and public_exists:
+        derived = subprocess.check_output(
+            [require_tool("ssh-keygen"), "-y", "-f", str(private_key)], text=True
+        ).split()
+        supplied = public_key.read_text(encoding="utf-8").split()
+        if len(supplied) < 2 or supplied[:2] != derived[:2]:
+            raise SystemExit("SSH public key does not match the private key; no hub changes were made.")
         info(f"Using existing SSH public key: {public_key}")
         lock_down_private_key(private_key)
         return
@@ -772,6 +845,7 @@ def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
     ssh_keygen = require_tool("ssh-keygen")
     if private_exists and not public_exists:
         info(f"Private key exists but public key is missing; deriving {public_key}")
+        public_key.parent.mkdir(parents=True, exist_ok=True)
         public_key.write_text(
             subprocess.check_output([ssh_keygen, "-y", "-f", str(private_key)], text=True).strip() + "\n",
             encoding="utf-8",
@@ -786,6 +860,10 @@ def ensure_keypair(private_key: pathlib.Path, public_key: pathlib.Path) -> None:
         [ssh_keygen, "-q", "-t", "ed25519", "-f", str(private_key), "-N", "", "-C", "harmony-owner"],
         check=True,
     )
+    generated_public = pathlib.Path(str(private_key) + ".pub")
+    if public_key.resolve() != generated_public.resolve():
+        public_key.parent.mkdir(parents=True, exist_ok=True)
+        public_key.write_bytes(generated_public.read_bytes())
     lock_down_private_key(private_key)
 
 
@@ -1358,7 +1436,7 @@ def open_root_shell(host: str, private_key: pathlib.Path) -> int:
     return subprocess.call(ssh)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Root an owned Harmony Hub over LAN using the original XMPP path.")
     parser.add_argument("--host", help="Harmony Hub IP address. If omitted, prompts interactively.")
     parser.add_argument("--xmpp-port", type=int, default=DEFAULT_XMPP_PORT)
@@ -1372,7 +1450,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignore-saved-hub-id", action="store_true", help="do not use cached Hub IDs; useful after factory reset or when moving between hubs")
     parser.add_argument("--use-global-saved-hub-id", action="store_true", help="also load legacy global hub_id.txt handoff files that are not tied to this host")
     parser.add_argument("--clear-saved-hub-id", action="store_true", help="remove cached Hub ID handoff files before running")
-    parser.add_argument("--dropbearmulti", default="dropbearmulti")
+    parser.add_argument("--dropbearmulti", default=str(SCRIPT_DIR / "dropbearmulti"))
     parser.add_argument("--private-key", default=str(default_key_path()))
     parser.add_argument("--pubkey", help="Public key to install. Default: <private-key>.pub")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
@@ -1396,11 +1474,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-name", help="Temporary package name. Default: fresh random name.")
     parser.add_argument("--no-shell", action="store_true", help="Install/start Dropbear but do not launch interactive SSH.")
     parser.add_argument("--dry-run", action="store_true", help="Validate local payload only; do not contact the hub.")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    for name in ("xmpp_port", "hbus_port"):
+        if not 1 <= getattr(args, name) <= 65535:
+            parser.error(f"--{name.replace('_', '-')} must be between 1 and 65535")
+    if args.ssh_wait <= 0:
+        parser.error("--ssh-wait must be positive")
+    return args
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     step("Harmony Hub LAN Tool")
     info("This tool is for an owned Harmony Hub on the same LAN as this computer.")
     if args.enable_xmpp_only:
@@ -1414,7 +1498,7 @@ def main() -> None:
         raise SystemExit("hub IP is required")
     if args.xmpp_enable_wait < 5:
         raise SystemExit("--xmpp-enable-wait must be at least 5 seconds")
-    if args.clear_saved_hub_id:
+    if args.clear_saved_hub_id and not args.dry_run:
         removed = delete_saved_hub_ids(host)
         print("cleared_saved_hub_id_files=" + (",".join(removed) if removed else "none"))
 
@@ -1466,6 +1550,21 @@ def main() -> None:
     if args.chunk_size < 256 or args.chunk_size > 1500:
         raise SystemExit("--chunk-size must be between 256 and 1500 for this firmware's log-write size limit")
 
+    if args.dry_run:
+        print(f"dropbearmulti={dropbearmulti}")
+        print(f"dropbearmulti_sha256={sha256_file(dropbearmulti)}")
+        print(f"dropbearmulti_elf_machine={machine[0]} ({machine[1]})")
+        if public_key.is_file():
+            manifest, chunks = build_payload(dropbearmulti, public_key, args.chunk_size)
+            print(f"payload_files={len(manifest['files'])} payload_chunks={len(chunks)}")
+        else:
+            info("SSH key/payload preparation deferred to the real run; no files were created.")
+        print("dry_run=true")
+        info("Dry run complete: no network calls or local changes were made. SSH key matching was not tested.")
+        return
+
+    if not args.no_shell:
+        require_tool("ssh")
     ensure_keypair(private_key, public_key)
     if not public_key.is_file():
         raise SystemExit(f"public key not found: {public_key}")
@@ -1477,10 +1576,6 @@ def main() -> None:
     print(f"pubkey={public_key}")
     print(f"temporary_package={package_name}")
     print(f"payload_files={len(manifest['files'])} payload_chunks={len(chunks)}")
-    if args.dry_run:
-        print("dry_run=true")
-        info("Dry run complete: local payload is valid and no network calls were made.")
-        return
 
     if not args.no_enable_xmpp:
         step("XMPP Availability")
@@ -1545,12 +1640,12 @@ def main() -> None:
         raise SystemExit("Dropbear did not open port 22 inside the wait window")
     if not args.no_shell:
         step("Opening Root Shell")
-        info("If OpenSSH reports a changed host key, the install still succeeded; reconnect after removing the old known_hosts entry.")
+        info("If OpenSSH reports a changed host key, verify that this is your hub before replacing the known_hosts entry.")
         ssh_code = open_root_shell(host, private_key)
         if ssh_code != 0:
             print("")
             print("WARNING: SSH is installed and port 22 is open, but the final SSH client exited with code " + str(ssh_code) + ".")
-            print("If this was a host-key or known_hosts warning, remove the old hub entry from your known_hosts file and reconnect:")
+            print("For a host-key warning, verify the hub identity before removing its old known_hosts entry and reconnecting:")
             print(f"  ssh -i {private_key} -o IdentitiesOnly=yes root@{host}")
         return
     step("Done")
