@@ -157,7 +157,7 @@ python3 -m venv .venv
 
 | Action | What it does |
 | --- | --- |
-| `usb-preflight` | Tests USB and reads device information |
+| `usb-preflight` | Reads device information over USB to check the connection |
 | `usb-sysinfo` | Reads `/rf/deviceinfo` |
 | `usb-hub-id` | Reads the provisioned hub ID; add `--save-hub-id` to save it locally |
 | `usb-wifi-status` | Reads the current Wi-Fi state |
@@ -172,6 +172,13 @@ Start with a read-only check:
 python3 run_harmony_hub_tool.py --action usb-preflight
 python3 run_harmony_hub_tool.py --action usb-wifi-status
 python3 run_harmony_hub_tool.py --action usb-wifi-scan --show-ssids
+```
+
+Preflight uses the hub's raw USB file protocol. It does not test file writes or
+enable SSH. To list detected USB interfaces without sending a hub command:
+
+```sh
+python3 harmony_usb_bridge.py --action probe
 ```
 
 To change Wi-Fi, leave the password out of the command and enter it at the
@@ -278,11 +285,9 @@ python3 -m unittest discover -s tests -v
 
 These tests cover CLI dispatch, launchers, file paths, dry runs, SSH keys, reply
 framing, Wi-Fi validation, USB locking, and firmware parsing. They have been run
-locally on Windows and Linux/WSL. The CI workflow also includes macOS; a passing
-offline test does not establish USB hardware compatibility. This code review
-did not root, reset, or flash a live hub.
+locally on Windows and Linux/WSL. The CI workflow also includes macOS. Offline
+tests do not prove that rooting, reset, or flashing works on a particular hub.
 
 The transport implementations are in `harmony_xmpp_root_shell.py` and
-`harmony_usb_bridge.py`. The USB bridge's `--action probe` lists attached
-devices. `SHA256SUMS.txt` records the distributed files; it is an integrity
-list, not a signed release.
+`harmony_usb_bridge.py`. `SHA256SUMS.txt` records the distributed files; it is
+an integrity list, not a signed release.
