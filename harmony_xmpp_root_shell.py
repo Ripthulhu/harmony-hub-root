@@ -1074,9 +1074,23 @@ def reopen_xmpp_after_app_restart(xmpp: XmppTransport, host: str, xmpp_port: int
         print(f"setup.firmware?reboot request did not complete: {exc}")
     xmpp.close()
     time.sleep(5)
-    if not wait_for_port(host, xmpp_port, 150):
-        raise SystemExit("XMPP service did not come back after app restart request")
-    xmpp.open()
+    deadline = time.monotonic() + 150
+    last_error = ""
+    while time.monotonic() < deadline:
+        if not is_port_open(host, xmpp_port):
+            time.sleep(3)
+            continue
+        try:
+            xmpp.open()
+            return
+        except (OSError, RuntimeError) as exc:
+            last_error = str(exc)
+            xmpp.close()
+            time.sleep(5)
+    raise SystemExit(
+        "XMPP service did not accept an authenticated session after app restart"
+        + (f": {last_error}" if last_error else "")
+    )
 
 
 def websocket_log_put(
@@ -1099,6 +1113,9 @@ def websocket_log_put(
                 resp = ws.call("harmony.log?put", {"resource": [{"fileName": file_name, "data": data}]}, timeout)
             except Exception as exc:  # noqa: BLE001
                 print(f"{label}: websocket log_put failed for hub id {hub_id}: {exc}")
+                if attempt < 3:
+                    time.sleep(2)
+                    continue
                 break
             code = response_code(resp)
             if not quiet or code not in ("", "200"):
