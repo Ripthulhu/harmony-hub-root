@@ -88,6 +88,9 @@ def lan_args(args: argparse.Namespace, enable_xmpp_only: bool) -> list[str]:
     private_key = args.private_key or str(pathlib.Path.home() / ".ssh" / "harmony_owner_ed25519")
     pubkey = args.pubkey or private_key + ".pub"
     argv = [
+        "--transport", args.transport,
+        "--usb-backend", args.usb_backend,
+        "--usb-device-path", args.usb_device_path,
         "--dropbearmulti",
         dropbearmulti,
         "--private-key",
@@ -193,6 +196,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action", choices=ACTION_CHOICES, default="")
     parser.add_argument("--hub-host", "--host", default="", help="Hub IP address or hostname for LAN actions")
     parser.add_argument("--hub-ip", default="")
+    parser.add_argument("--transport", choices=("xmpp", "post", "usb"), default="xmpp")
+    parser.add_argument("--usb-device-path", default="")
     parser.add_argument("--hub-id", action="append", default=[])
     parser.add_argument("--ignore-saved-hub-id", action="store_true", help="do not use cached Hub IDs for LAN/XMPP actions")
     parser.add_argument("--use-global-saved-hub-id", action="store_true", help="allow legacy global hub_id.txt cache entries")

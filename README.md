@@ -6,8 +6,8 @@ firmware upload. MyHarmony, a build server, SCP, and TFTP are not required to
 run it. Use it only on hubs you own or have permission to modify.
 
 The root procedure was tested on firmware **4.15.600**. Other firmware versions
-and hardware revisions are not confirmed. USB-only rooting is not implemented;
-USB can put a hub on Wi-Fi, but rooting still uses the LAN connection.
+and hardware revisions are not confirmed. The default root transport is XMPP;
+explicit POST and USB hbus transports are also available for fresh hubs (below).
 
 ## Before you start
 
@@ -22,7 +22,8 @@ USB can put a hub on Wi-Fi, but rooting still uses the LAN connection.
 The tool can try to enable XMPP through port 8088 when port 5222 is closed.
 That attempt depends on the hub's configuration and does not replace initial
 setup. A factory-reset hub needs setup again, even if USB Wi-Fi provisioning
-succeeds.
+succeeds, unless using an explicit fresh-hub root transport below. Root access
+alone does not provision an account or create an activity configuration.
 
 Keep the SSH private key. Anyone who has it can log in as root. Keep the hub's
 SSH and control ports off the public internet.
@@ -103,6 +104,31 @@ existing SSH access before using it on an already modified hub.
 
 This tool does not install the web UI, MQTT service, or cloud blocker. Those are
 in [harmony-hub-control](https://github.com/Ripthulhu/harmony-hub-control).
+
+### Fresh-hub transports (explicit opt-in)
+
+```sh
+python3 run_harmony_hub_tool.py --action lan-root --transport post --hub-host "<hub-ip>" --ignore-saved-hub-id --no-shell
+python3 run_harmony_hub_tool.py --action lan-root --transport usb --hub-host "<hub-ip>" --ignore-saved-hub-id --no-shell
+```
+
+Both run the same marker → file-transfer → Lua discovery → Dropbear chain,
+without enabling XMPP, using WebSocket, or reading/writing hub-ID handoff files.
+POST uses port 8088 and a `.myharmony.com` Origin; on a provisioned mode-3 hub
+only `setup.account?getProvisionInfo` is allowed. USB relays engine hbus through
+usbhid (source 6), using individually padded 64-byte LTCP packets. It requires
+exactly one connected hub unless `--usb-device-path` is given; `--usb-backend`
+selects its HID backend. LAN host is used for the final SSH check, not USB target
+selection. USB still needs the platform dependencies described below.
+
+Neither transport automatically retries writes or switches transports/reboots
+when the TDE gate fails. A hub ID is not required or invented. Provision the hub
+separately before installing software that requires its hub ID. `--dry-run`
+validates local payload only and does not open either transport.
+
+Live smoke on one provisioned 4.15.600 hub: POST getProvisionInfo and USB
+connect.sysinfo?get passed. Full post-reset rooting is not established by those
+read-only tests. Do not factory-reset a working configuration merely to try it.
 
 ### Hub ID handoff
 

@@ -17,6 +17,7 @@ import argparse
 import base64
 import hashlib
 import html
+import http.client
 import json
 import os
 import pathlib
@@ -180,6 +181,66 @@ class XmppResponse:
     code: str
     error: str
     payload: str
+
+
+class HttpPostTransport:
+    """Plain JSON hbus, usable without a hub ID when the hub is unprovisioned.
+
+    Mode 3 permits only getProvisionInfo. Never fall back to another transport.
+    """
+
+    def __init__(self, host: str, port: int = DEFAULT_HBUS_PORT) -> None:
+        self.url = f"http://{host}:{port}/"
+        # Do not use environment proxies, redirect requests, or replay writes.
+
+    def call(self, cmd: str, params: Any, timeout: int = 20) -> dict[str, Any]:
+        call_id = os.urandom(8).hex()
+        body = json.dumps({"id": call_id, "cmd": cmd, "params": params, "timeout": timeout}, separators=(",", ":")).encode("utf-8")
+        url = urllib.parse.urlsplit(self.url)
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=timeout + 8)
+        try:
+            conn.request("POST", "/", body, {"Content-Type": "application/json", "Origin": "http://sl.dhg.myharmony.com"})
+            response = conn.getresponse()
+            raw = response.read(2_000_001)
+            if len(raw) > 2_000_000:
+                raise RuntimeError("HTTP hbus response exceeds 2 MB")
+            if response.status != 200:
+                raise RuntimeError(f"HTTP hbus status {response.status}: {raw[:500]!r}")
+            result = json.loads(raw)
+            if not isinstance(result, dict) or str(result.get("id")) != call_id or "code" not in result:
+                raise RuntimeError("HTTP hbus response has no matching ID/code")
+            return result
+        finally:
+            conn.close()
+
+
+class JsonRootTransport:
+    """Adapt the existing root flow to structured JSON, with no XMPP/WS fallback."""
+
+    def __init__(self, transport: Any) -> None:
+        self.transport = transport
+
+    def __enter__(self) -> "JsonRootTransport":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        pass
+
+    def call(self, cmd: str, body: Any = "", timeout: int = 20) -> XmppResponse:
+        if isinstance(body, str):
+            head, separator, content = body.partition("&content=")
+            params = dict(part.split("=", 1) for part in head.split("&") if "=" in part)
+            if separator:
+                params["content"] = json.loads(content)
+        else:
+            params = body
+        result = self.transport.call(cmd, params, timeout)
+        data = result.get("data")
+        # LTCP's envelope code is 200 even when the engine rejects the verb.
+        code = str(data.get("errorCode", result.get("code", ""))) if isinstance(data, dict) else str(result.get("code", ""))
+        error = str(data.get("errorString", "")) if isinstance(data, dict) else str(result.get("msg", ""))
+        payload = data if isinstance(data, str) else json.dumps(data, separators=(",", ":"))
+        return XmppResponse(json.dumps(result), code, error, payload)
 
 
 def recv_until(sock: socket.socket, needles: list[bytes], timeout: float = 10.0, limit: int = 2_000_000) -> str:
@@ -1211,6 +1272,8 @@ def save_hub_id_handoff(host: str, hub_id: str, candidates: list[str]) -> list[p
 
 
 def refresh_xmpp_session(xmpp: XmppTransport, host: str, xmpp_port: int, label: str) -> None:
+    if isinstance(xmpp, JsonRootTransport):
+        return
     print(label)
     xmpp.close()
     if not wait_for_port(host, xmpp_port, 60):
@@ -1227,7 +1290,7 @@ def open_tde_gate(
     sysinfo_payload: str,
 ) -> None:
     step("Opening TDE Gate")
-    info("Writing /etc/tdeenable through the local XMPP log-write path.")
+    info("Writing /etc/tdeenable through the selected local log-write transport.")
     info("That marker unlocks the hub's development file-transfer API for the rest of the install.")
     print("Opening TDE gate with harmony.log?put traversal...")
     log_put(xmpp, "../etc/tdeenable", "1\n", "write /etc/tdeenable")
@@ -1236,6 +1299,9 @@ def open_tde_gate(
     if ok:
         info("TDE gate is open.")
         return
+
+    if isinstance(xmpp, JsonRootTransport):
+        raise SystemExit(f"TDE gate failed on selected JSON transport: code={resp.code} error={resp.error}; no fallback/reboot attempted")
 
     if resp.code == "594":
         info("The marker write was accepted, but this app process still says production mode; requesting an app-layer restart.")
@@ -1250,7 +1316,7 @@ def open_tde_gate(
             info("TDE gate opened after app-layer restart.")
             return
 
-    hub_ids = collect_hub_ids(host, hbus_port, xmpp, sysinfo_payload)
+    hub_ids = [] if isinstance(xmpp, JsonRootTransport) else collect_hub_ids(host, hbus_port, xmpp, sysinfo_payload)
 
     if resp.code == "594" and hub_ids and try_websocket_tde_write(host, hbus_port, domain, hub_ids):
         info("Retrying the marker write through WebSocket because this firmware parses that path more reliably.")
@@ -1298,14 +1364,14 @@ def upload_and_install(
     stage_chunks_abs = stage_path + "/chunks"
 
     open_tde_gate(xmpp, host, xmpp_port, hbus_port, domain, sysinfo_payload)
-    step("Finding WebSocket Hub ID")
-    info("The installer uses XMPP for the initial gate and WebSocket for structured package writes.")
-    hub_ids = collect_hub_ids(host, hbus_port, xmpp, sysinfo_payload)
+    step("Selecting Installer Transport")
+    info("POST/USB stay on the selected transport; the legacy XMPP path may use WebSocket writes.")
+    hub_ids = [] if isinstance(xmpp, JsonRootTransport) else collect_hub_ids(host, hbus_port, xmpp, sysinfo_payload)
     selected_hub_id = hub_ids[0] if hub_ids else ""
     if hub_ids:
         print("auto_detected_hub_ids=" + ",".join(hub_ids))
     else:
-        info("No WebSocket hub id was auto-detected; falling back to XMPP where possible.")
+        info("No WebSocket hub ID selected; using the selected root transport throughout.")
 
     def raw_log_put(file_name: str, data: str, label: str, timeout: int = 30, quiet: bool = False) -> None:
         if hub_ids and websocket_log_put(host, hbus_port, domain, hub_ids, file_name, data, label, timeout, quiet):
@@ -1338,7 +1404,7 @@ def upload_and_install(
     )
 
     step("Verifying Staged Files")
-    info("Opening a fresh XMPP session before readback because long WebSocket write bursts can stale the old session.")
+    info("Checking staged files before uploading the payload.")
     refresh_xmpp_session(xmpp, host, xmpp_port, "Refreshing XMPP session before readback checks...")
     pkg = json_get(xmpp, data_traversal_path(package_abs), "manifest.json", "read package manifest")
     plugin = json_get(xmpp, data_traversal_path(package_abs), package_name + ".lua", "read package lua")
@@ -1382,9 +1448,9 @@ def upload_and_install(
             time.sleep(5)
 
     if not triggered:
-        print("WebSocket trigger was not available; trying XMPP automation discovery...")
-        discover = xmpp.call("harmony.automation?discover", f"gatewayType={package_name}", 60)
-        print_xmpp("xmpp discover", discover)
+        print("Triggering automation discovery through the selected root transport...")
+        discover = xmpp.call("harmony.automation?discover", f"gatewayType={package_name}", 240)
+        print_xmpp("automation discover", discover)
         if discover.code != "200":
             raise SystemExit(f"automation discover failed: code={discover.code or '?'} error={discover.error or '-'}")
 
@@ -1429,6 +1495,9 @@ def open_root_shell(host: str, private_key: pathlib.Path) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Root an owned Harmony Hub over LAN using the original XMPP path.")
     parser.add_argument("--host", help="Harmony Hub IP address. If omitted, prompts interactively.")
+    parser.add_argument("--transport", choices=("xmpp", "post", "usb"), default="xmpp", help="Root API transport; post/usb never use XMPP or WebSocket")
+    parser.add_argument("--usb-backend", choices=("auto", "hidapi", "hidraw", "winhid"), default="auto")
+    parser.add_argument("--usb-device-path", default="", help="Explicit USB HID target (otherwise exactly one device is required)")
     parser.add_argument("--xmpp-port", type=int, default=DEFAULT_XMPP_PORT)
     parser.add_argument("--hbus-port", type=int, default=DEFAULT_HBUS_PORT)
     parser.add_argument("--domain", default=DEFAULT_DOMAIN)
@@ -1465,6 +1534,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-shell", action="store_true", help="Install/start Dropbear but do not launch interactive SSH.")
     parser.add_argument("--dry-run", action="store_true", help="Validate local payload only; do not contact the hub.")
     args = parser.parse_args(argv)
+    if args.transport != "xmpp" and args.enable_xmpp_only:
+        parser.error("--enable-xmpp-only requires --transport xmpp")
     for name in ("xmpp_port", "hbus_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be between 1 and 65535")
@@ -1567,7 +1638,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"temporary_package={package_name}")
     print(f"payload_files={len(manifest['files'])} payload_chunks={len(chunks)}")
 
-    if not args.no_enable_xmpp:
+    if args.transport == "xmpp" and not args.no_enable_xmpp:
         step("XMPP Availability")
         info("If port 5222 is closed, the tool will try the Harmony app's automation-config toggle over 8088.")
         if not enable_xmpp_with_websocket(
@@ -1590,8 +1661,16 @@ def main(argv: list[str] | None = None) -> None:
             )
 
     step("Connecting To Hub")
-    info(f"Opening local XMPP API at {host}:{args.xmpp_port}.")
-    with XmppTransport(host, args.xmpp_port) as xmpp:
+    info(f"Selected root API transport: {args.transport} (target {host}).")
+    if args.transport == "post":
+        transport = JsonRootTransport(HttpPostTransport(host, args.hbus_port))
+    elif args.transport == "usb":
+        import harmony_usb_bridge as usb
+        usb_options = usb.parse_args(["--backend", args.usb_backend, "--device-path", args.usb_device_path])
+        transport = JsonRootTransport(usb.UsbHbusTransport(usb_options))
+    else:
+        transport = XmppTransport(host, args.xmpp_port)
+    with transport as xmpp:
         sysinfo = xmpp.call("connect.sysinfo?get", "", 15)
         print_xmpp("connect.sysinfo?get", sysinfo)
         info("Hub responded; continuing with the installer.")
@@ -1618,8 +1697,7 @@ def main(argv: list[str] | None = None) -> None:
         info("The Harmony Hub Control web UI installer reads the per-user handoff file automatically.")
     else:
         print("")
-        print("WARNING: Root SSH was installed, but no Hub ID was detected.")
-        print("The web UI installer requires the real Hub ID. Re-run this tool with the hub online and save the full output.")
+        print("No Hub ID handoff written. On a fresh hub this is expected; provision before installing the web UI.")
 
     step("Waiting For SSH")
     info("The installer has finished; waiting for Dropbear to listen on port 22.")

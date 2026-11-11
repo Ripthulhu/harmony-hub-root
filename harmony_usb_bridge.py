@@ -453,7 +453,7 @@ class HidApiBackend(HidBackend):
         return devices
 
     def open(self, device: DeviceInfo) -> HidHandle:
-        path = self._raw_paths.get(device.path, device.path)
+        path = self._raw_paths.get(device.path, os.fsencode(device.path))
         return HidApiHandle(self._hid, path)
 
 
@@ -1095,6 +1095,128 @@ def raw_done_frame() -> bytes:
     frame = bytearray(64)
     frame[0] = 0x7E
     return bytes(frame)
+
+
+def hbus_command_frames(message: dict[str, Any], sequence: int) -> list[bytes]:
+    """LTCP command 8 in USB's fixed-64-byte mode.
+
+    This is NOT the file-write secondary format (00 length payload). The secondary
+    packets are individually padded; bit 7 marks string data. Unlike the packed
+    loopback transport, USB discards padding after each primary/secondary.
+    """
+    payload = json.dumps(message, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    size = len(payload)
+    if not 0 < size <= 16383:
+        raise UsbBridgeError("hbus JSON must be 1..16383 bytes")
+    if not 0 <= sequence <= 0x3F:
+        raise UsbBridgeError("hbus sequence must be 0..63")
+    chunks = [payload[index:index + 62] for index in range(0, size, 62)]
+    frames = raw_primary_frames(8, sequence, [raw_param_packet_count_word(len(chunks) + 1)])
+    for index, chunk in enumerate(chunks, 1):
+        frames.append((bytes([index & 0x7F, 0x80 | len(chunk)]) + chunk).ljust(64, b"\x00"))
+    return frames
+
+
+def hbus_response_messages(raw: bytes) -> list[dict[str, Any]]:
+    """Decode complete command/notify records; ignore incomplete trailing data.
+
+    Both packed primary/secondary records and separately padded primaries occur.
+    Never search for a header inside JSON payload bytes.
+    """
+    messages = []
+    start = 0
+    while start + 4 <= len(raw):
+        if raw[start] != 0xFF or raw[start + 1] not in (8, 9):
+            start += 64
+            continue
+        if raw[start + 2] == 0xFF:
+            raise UsbBridgeError("LTCP hbus error frame: " + hex_string(raw[start:start + 64]))
+        pos = start + 4
+        packets = 0
+        for _ in range(raw[start + 3] & 0x3F):
+            if pos >= len(raw):
+                return messages
+            tag = raw[pos]
+            pos += 1
+            size = tag & 0x3F
+            if tag & 0x80:
+                end = raw.find(b"\x00", pos)
+                if end < 0:
+                    return messages
+                pos = end + 1
+            else:
+                if pos + size > len(raw):
+                    return messages
+                packets = int.from_bytes(raw[pos:pos + size], "big")
+                pos += size
+        if not 1 <= packets <= 65535:
+            raise UsbBridgeError(f"Invalid hbus LTCP packet count: {packets}")
+        payload = bytearray()
+        for _ in range(packets - 1):
+            boundary = ((pos // 64) + 1) * 64
+            if pos % 64 and not any(raw[pos:min(boundary, len(raw))]):
+                if boundary >= len(raw):
+                    return messages
+                pos = boundary
+            if pos + 2 > len(raw):
+                return messages
+            hdr = raw[pos + 1]
+            pos += 2
+            size = hdr & 0x3F
+            if hdr & 0x40:
+                if pos >= len(raw):
+                    return messages
+                size = (size << 8) | raw[pos]
+                pos += 1
+            if pos + size > len(raw):
+                return messages
+            payload.extend(raw[pos:pos + size])
+            pos += size
+        if payload:
+            try:
+                message = json.loads(payload)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise UsbBridgeError("Invalid hbus JSON response") from exc
+            if isinstance(message, dict):
+                messages.append(message)
+        start = ((pos + 63) // 64) * 64
+    return messages
+
+
+class UsbHbusTransport:
+    """Engine hbus over the existing usbhid source-6 bridge; no LAN calls/retries."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.bridge = HarmonyUsbBridge(args)
+        self.last_exchange: dict[str, Any] = {}
+
+    def call(self, cmd: str, params: Any, timeout: int = 20) -> dict[str, Any]:
+        call_id = os.urandom(8).hex()
+        message = {"id": call_id, "cmd": cmd, "data": params, "timeout": timeout}
+        sequence = self.bridge.new_raw_sequence() & 0x3F
+        frames = hbus_command_frames(message, sequence)
+        with usb_process_lock():
+            if not self.bridge.args.device_path and self.bridge._device is None:
+                devices = self.bridge.enumerate_devices()
+                if len(devices) != 1:
+                    raise UsbBridgeError(f"hbus requires exactly one USB device, found {len(devices)}; specify --usb-device-path")
+                self.bridge.args.device_path = devices[0].path
+                self.bridge.args.backend = devices[0].backend
+            handle, device = self.bridge.open_handle()
+            try:
+                def matched(raw: bytes) -> bool:
+                    if len(raw) > 2_000_000:
+                        raise UsbBridgeError("USB hbus response exceeds 2 MB")
+                    return any(str(item.get("id")) == call_id and "code" in item for item in hbus_response_messages(raw))
+
+                raw, reports = self.bridge.exchange_reports(handle, device, frames, (timeout + 8) * 1000, True, matched)
+                self.last_exchange = {"requestId": call_id, "rawHex": hex_string(raw), "reports": reports}
+                for reply in hbus_response_messages(raw):
+                    if str(reply.get("id")) == call_id and "code" in reply:
+                        return reply
+                raise UsbBridgeError(f"USB hbus timed out without matching response for {cmd}; no retry made")
+            finally:
+                handle.close()
 
 
 def refresh_hid_io_handles(handle: HidHandle) -> bool:
