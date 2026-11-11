@@ -1089,6 +1089,19 @@ def json_put(xmpp: XmppTransport, path: str, file_name: str, content: Any, label
     require_xmpp_ok(label, resp)
 
 
+def json_put_traversal(xmpp: XmppTransport, traversal_name: str, data: str, label: str) -> None:
+    """Write a traversal path such as ../../pkg/x/x.lua through jsonfiletransfer.
+
+    The unlocked JSON file API takes a separate folder and file name; split the
+    traversal path at its last slash. Used when the mode-3-only log writer is
+    unavailable on an unprovisioned hub.
+    """
+    path, _, file_name = traversal_name.rpartition("/")
+    if not path or not file_name:
+        raise SystemExit(f"cannot split traversal path {traversal_name!r}")
+    json_put(xmpp, path, file_name, data, label)
+
+
 def log_put(xmpp: XmppTransport, file_name: str, data: str, label: str, timeout: int = 30) -> None:
     resp = xmpp.call("harmony.log?put", {"resource": [{"fileName": file_name, "data": data}]}, timeout)
     require_xmpp_ok(label, resp)
@@ -1292,8 +1305,18 @@ def open_tde_gate(
     step("Opening TDE Gate")
     info("Writing /etc/tdeenable through the selected local log-write transport.")
     info("That marker unlocks the hub's development file-transfer API for the rest of the install.")
+    print("Checking whether /etc/tdeenable is already present...")
+    ok, resp = tde_readback(xmpp, "verify /etc/tdeenable (pre-check)")
+    if ok:
+        info("TDE gate is already open; skipping the log-write marker.")
+        return
     print("Opening TDE gate with harmony.log?put traversal...")
-    log_put(xmpp, "../etc/tdeenable", "1\n", "write /etc/tdeenable")
+    try:
+        log_put(xmpp, "../etc/tdeenable", "1\n", "write /etc/tdeenable")
+    except SystemExit as exc:
+        # A different primitive (for example hal's /tde/enable) may have
+        # created the marker already; the readback below decides.
+        print(f"marker write did not complete: {exc}")
     time.sleep(1)
     ok, resp = tde_readback(xmpp, "verify /etc/tdeenable")
     if ok:
@@ -1376,7 +1399,17 @@ def upload_and_install(
     def raw_log_put(file_name: str, data: str, label: str, timeout: int = 30, quiet: bool = False) -> None:
         if hub_ids and websocket_log_put(host, hbus_port, domain, hub_ids, file_name, data, label, timeout, quiet):
             return
-        log_put(xmpp, file_name, data, label, timeout)
+        try:
+            log_put(xmpp, file_name, data, label, timeout)
+            return
+        except SystemExit as exc:
+            if not isinstance(xmpp, JsonRootTransport):
+                raise
+            # harmony.log?put is mode-3-only. On an unprovisioned hub the
+            # unlocked JSON file API is the only writer, and it only accepts
+            # JSON text; Lua source cannot go through it.
+            print(f"log writer unavailable ({exc}); falling back to jsonfiletransfer?put")
+        json_put_traversal(xmpp, file_name, data, label)
 
     def structured_put(path: str, file_name: str, content: Any, label: str, timeout: int = 30) -> None:
         if hub_ids and websocket_json_put(host, hbus_port, domain, hub_ids, path, file_name, content, label, timeout):
