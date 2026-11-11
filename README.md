@@ -101,6 +101,20 @@ verified across those operations. Re-running the installer replaces
 `authorized_keys` with the selected public key and restarts Dropbear. Back up
 existing SSH access before using it on an already modified hub.
 
+### Bundled Dropbear
+
+`dropbearmulti` is Dropbear 2025.89 as one static MIPS binary. `dbclient` and
+`scp` are compiled in too, but the installer links only `dropbear` and
+`dropbearkey`. It comes from the same build as harmony-hub-control's
+`payload/bin/dropbearmulti`: the build script
+[`build/build_harmony_tools_kali.sh`](https://github.com/schlambos/harmony-hub-control/blob/63e245d/build/build_harmony_tools_kali.sh)
+reproduces that file exactly (577,296 bytes, SHA-256
+`e2ea632aed8b31dc5ea56b9673cbd983ec83260a97d33f891a0cebf51d5c6c8d`).
+The copy here then has its unloaded `.pdr` section removed with
+`mips-buildroot-linux-uclibc-strip -R .pdr` from the same Bootlin
+`mips32--uclibc--stable-2017.05` toolchain (binutils 2.27), giving 535,652
+bytes and the SHA-256 in `SHA256SUMS.txt`. Code and data are unchanged.
+
 This tool does not install the web UI, MQTT service, or cloud blocker. Those are
 in [harmony-hub-control](https://github.com/Ripthulhu/harmony-hub-control).
 
