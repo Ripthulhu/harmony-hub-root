@@ -93,8 +93,80 @@ local function writeAll(path, data)
   mkdirp(dirname(path))
   local f, err = io.open(path, "wb")
   if not f then error("write failed " .. path .. ": " .. tostring(err)) end
-  f:write(data or "")
+  local ok, werr = f:write(data or "")
+  local cok, cerr = f:close()
+  if not ok or not cok then error("write failed " .. path .. ": " .. tostring(werr or cerr)) end
+end
+
+-- Install files without rewriting the ones already there, all or nothing.
+-- A file with the same bytes is left alone (and any hard link to it:
+-- Melodious links its Dropbear to /data/rootssh/bin/dropbearmulti). Every
+-- other file is first written beside its destination as <path>.rootssh-new
+-- with its mode; only when all of them are written are they renamed into
+-- place. So a write that fails (a full flash) changes nothing, the new
+-- files never appear one by one (a wrapper without the binary it runs),
+-- none is ever in place without its execute bits, and a running program
+-- keeps its own copy. Truncating in place would rewrite that program under
+-- it: on the hub's unionfs, a running binary reached by another hard-linked
+-- path is not write-protected.
+local function sameBytes(path, data)
+  local f = io.open(path, "rb")
+  if not f then return false end
+  local same = f:seek("end") == #data
+  if same then
+    f:seek("set", 0)
+    local pos = 1
+    while same and pos <= #data do
+      local block = f:read(65536)
+      same = block ~= nil and block == string.sub(data, pos, pos + #block - 1)
+      pos = pos + (block and #block or 0)
+    end
+  end
   f:close()
+  return same
+end
+
+local function stageFile(path, data, mode)
+  local tmp = path .. ".rootssh-new"
+  os.remove(tmp)
+  local ok, err = pcall(writeAll, tmp, data)
+  if ok and mode then
+    local rc = os.execute("chmod " .. mode .. " " .. shellQuote(tmp))
+    if rc ~= 0 and rc ~= true then
+      ok, err = false, "chmod failed " .. tmp
+    end
+  end
+  if not ok then
+    os.remove(tmp)
+    error(err, 0)
+  end
+  return tmp
+end
+
+-- files: a list of {path=, data= or load=function() return data end, mode=}.
+-- Returns how many were replaced.
+local function replaceFiles(files)
+  local staged = {}
+  local ok, err = pcall(function()
+    for _, file in ipairs(files) do
+      local data = file.data or file.load()
+      if not sameBytes(file.path, data) then
+        table.insert(staged, {tmp = stageFile(file.path, data, file.mode), path = file.path})
+      end
+    end
+  end)
+  if not ok then
+    for _, s in ipairs(staged) do os.remove(s.tmp) end
+    error(err, 0)
+  end
+  for i, s in ipairs(staged) do
+    local rok, rerr = os.rename(s.tmp, s.path)
+    if not rok then
+      for j = i, #staged do os.remove(staged[j].tmp) end
+      error("rename failed " .. s.path .. ": " .. tostring(rerr))
+    end
+  end
+  return #staged
 end
 
 local function b64decode(data)
@@ -139,21 +211,28 @@ end
 local function install()
   local manifest = json.decode(readAll(STAGE .. "/manifest.json"))
   local installed = {}
+  local files = {}
 
   for _, file in ipairs(manifest.files or {}) do
-    local parts = {}
-    for i = 1, tonumber(file.chunks or 0) do
-      table.insert(parts, readAll(STAGE .. "/chunks/" .. file.id .. "." .. tostring(i)))
-    end
-    local data = b64decode(table.concat(parts, ""))
-    if tonumber(file.bytes or 0) ~= #data then
-      error("size mismatch for " .. file.path .. ": got " .. tostring(#data))
-    end
-    writeAll(file.path, data)
-    if file.mode and string.match(file.mode, "^[0-7][0-7][0-7]$") then
+    local mode = file.mode and string.match(file.mode, "^[0-7][0-7][0-7]$")
+    table.insert(files, {path = file.path, mode = mode, load = function()
+      local parts = {}
+      for i = 1, tonumber(file.chunks or 0) do
+        table.insert(parts, readAll(STAGE .. "/chunks/" .. file.id .. "." .. tostring(i)))
+      end
+      local data = b64decode(table.concat(parts, ""))
+      if tonumber(file.bytes or 0) ~= #data then
+        error("size mismatch for " .. file.path .. ": got " .. tostring(#data))
+      end
+      return data
+    end})
+    table.insert(installed, file.path)
+  end
+  replaceFiles(files)
+  for _, file in ipairs(files) do
+    if file.mode then
       os.execute("chmod " .. file.mode .. " " .. shellQuote(file.path))
     end
-    table.insert(installed, file.path)
   end
 
   for _, command in ipairs(manifest.commands or {}) do
@@ -166,7 +245,8 @@ end
 function discover(self)
   local ok, err = pcall(install)
   if not ok then
-    saveResult(false, {error = tostring(err)})
+    -- Recorded if it can be (on a full flash this write can fail too).
+    pcall(saveResult, false, {error = tostring(err)})
     return {}
   end
   return {["rootssh"] = {id = "rootssh", type = "rootssh", name = "Root SSH"}}
